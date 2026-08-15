@@ -1,0 +1,91 @@
+# Example wiring of: this control plane + Envoy + a placeholder for the
+# separate envoy-acme control plane + one auto-routed demo service.
+#
+# envoy-acme is NOT part of this repo. It must serve TLS certs via SDS
+# (gRPC) reachable at ACME_SDS_HOST:ACME_SDS_PORT below, for a secret named
+# CERT_SECRET_NAME covering *.${BASE_DOMAIN}.
+
+services:
+  envoy-control-plane:
+    build: .
+    environment:
+      BASE_DOMAIN: nas.pfrem.me
+      HTTP_PORT: "80"
+      HTTPS_PORT: "443"
+      XDS_PORT: "18000"
+      DOCKER_NETWORK: proxy
+      CERT_SECRET_NAME: wildcard-cert
+      ACME_SDS_CLUSTER_NAME: acme_sds_cluster
+      STATIC_CONFIG_PATH: /etc/envoy-control-plane/static-routes.yaml
+      # Optional read-only HTML page showing discovered/configured routes.
+      INFO_ENDPOINT_ENABLED: "true"
+      INFO_PORT: "9902"
+    volumes:
+      # Read-only is enough - the control plane only lists/inspects/watches.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/static-routes.example.yaml:/etc/envoy-control-plane/static-routes.yaml:ro
+    ports:
+      - "9902:9902" # info page - http://localhost:9902/, drop if you don't want it exposed
+    networks:
+      - proxy
+    # Runs as root in the image so it can read /var/run/docker.sock, which
+    # is normally owned by root/the docker group on the host.
+
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    depends_on:
+      - envoy-control-plane
+    environment:
+      CONTROL_PLANE_HOST: envoy-control-plane
+      XDS_PORT: "18000"
+      ACME_SDS_HOST: envoy-acme
+      ACME_SDS_PORT: "19000"
+      ACME_SDS_CLUSTER_NAME: acme_sds_cluster
+      ENVOY_ADMIN_PORT: "9901"
+      ENVOY_NODE_ID: envoy-1
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        sed \
+          -e "s|\$${CONTROL_PLANE_HOST}|$$CONTROL_PLANE_HOST|g" \
+          -e "s|\$${XDS_PORT}|$$XDS_PORT|g" \
+          -e "s|\$${ACME_SDS_HOST}|$$ACME_SDS_HOST|g" \
+          -e "s|\$${ACME_SDS_PORT}|$$ACME_SDS_PORT|g" \
+          -e "s|\$${ACME_SDS_CLUSTER_NAME}|$$ACME_SDS_CLUSTER_NAME|g" \
+          -e "s|\$${ENVOY_ADMIN_PORT}|$$ENVOY_ADMIN_PORT|g" \
+          -e "s|\$${ENVOY_NODE_ID}|$$ENVOY_NODE_ID|g" \
+          /etc/envoy/bootstrap.yaml.tmpl > /etc/envoy/bootstrap.yaml
+        exec envoy -c /etc/envoy/bootstrap.yaml
+    volumes:
+      - ./envoy/bootstrap.yaml.tmpl:/etc/envoy/bootstrap.yaml.tmpl:ro
+    ports:
+      - "80:80"
+      - "443:443"
+      - "9901:9901" # admin interface - drop this in production
+    networks:
+      - proxy
+
+  # envoy-acme:
+  #   image: your-envoy-acme-image
+  #   environment:
+  #     BASE_DOMAIN: nas.pfrem.me
+  #     CERT_SECRET_NAME: wildcard-cert
+  #     SDS_PORT: "19000"
+  #   networks:
+  #     - proxy
+
+  # Demo service: automatically becomes https://myapp.nas.pfrem.me
+  myapp:
+    image: nginx:alpine
+    labels:
+      envoy.enable: "true"
+      envoy.http.routers.web.subdomain: myapp
+      envoy.http.routers.web.port: "80"
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    name: proxy

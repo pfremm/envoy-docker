@@ -1,0 +1,77 @@
+# Envoy static bootstrap template. Placeholders (${VAR}) are substituted at
+# container start (see docker-compose.example.yml) before Envoy reads it.
+#
+# Listeners, routes, clusters and endpoints for actual traffic are NOT
+# defined here - they come dynamically from envoy-control-plane via ADS
+# (xds_cluster below). TLS certificates come dynamically from the separate
+# envoy-acme control plane via SDS (the ${ACME_SDS_CLUSTER_NAME} cluster
+# below) - envoy-control-plane's generated listener only references that
+# cluster + a secret name, it never talks to envoy-acme directly.
+
+node:
+  cluster: envoy-docker-proxy
+  id: ${ENVOY_NODE_ID}
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: ${ENVOY_ADMIN_PORT}
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc:
+          cluster_name: xds_cluster
+  cds_config:
+    resource_api_version: V3
+    ads: {}
+  lds_config:
+    resource_api_version: V3
+    ads: {}
+
+static_resources:
+  clusters:
+    # envoy-control-plane: this repo's ADS server (LDS/RDS/CDS/EDS).
+    - name: xds_cluster
+      connect_timeout: 5s
+      type: STRICT_DNS
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: ${CONTROL_PLANE_HOST}
+                      port_value: ${XDS_PORT}
+
+    # envoy-acme: the separate control plane that serves TLS certs via SDS.
+    # Its cluster name here MUST match ACME_SDS_CLUSTER_NAME given to
+    # envoy-control-plane, since that's the only thing tying the two
+    # together (the generated HTTPS listener just references this cluster
+    # by name).
+    - name: ${ACME_SDS_CLUSTER_NAME}
+      connect_timeout: 5s
+      type: STRICT_DNS
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: ${ACME_SDS_CLUSTER_NAME}
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: ${ACME_SDS_HOST}
+                      port_value: ${ACME_SDS_PORT}
