@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -16,6 +17,7 @@ import (
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	cachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
@@ -67,6 +69,14 @@ func Merge(dockerRoutes, staticRoutes map[string]model.Route, logger *slog.Logge
 
 // BuildSnapshot turns a merged route map into a full xDS resource snapshot.
 func BuildSnapshot(version string, routes map[string]model.Route, cfg Config) (cachev3.ResourceSnapshot, error) {
+	return BuildSnapshotWithLogger(version, routes, cfg, nil)
+}
+
+// BuildSnapshotWithLogger is BuildSnapshot with an optional logger. When
+// logger is non-nil, subdomains whose rule cannot be translated to an Envoy
+// route match (e.g. ClientIP, or negation on a non-header matcher) are
+// skipped with an actionable warning instead of failing the whole snapshot.
+func BuildSnapshotWithLogger(version string, routes map[string]model.Route, cfg Config, logger *slog.Logger) (cachev3.ResourceSnapshot, error) {
 	names := sortedSubdomains(routes)
 
 	clusters := make([]cachetypes.Resource, 0, len(names))
@@ -79,7 +89,7 @@ func BuildSnapshot(version string, routes map[string]model.Route, cfg Config) (c
 
 	httpListener := buildHTTPListener(cfg.HTTPPort)
 	httpsListener := buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName)
-	routeConfig := buildHTTPSRouteConfiguration(routes, names, cfg.BaseDomain)
+	routeConfig := buildHTTPSRouteConfiguration(routes, names, cfg.BaseDomain, logger)
 
 	resources := map[resourcev3.Type][]cachetypes.Resource{
 		resourcev3.ClusterType:  clusters,
@@ -136,23 +146,128 @@ func buildClusterLoadAssignment(route model.Route) *endpointv3.ClusterLoadAssign
 	}
 }
 
-func buildHTTPSRouteConfiguration(routes map[string]model.Route, names []string, baseDomain string) *routev3.RouteConfiguration {
-	vhosts := make([]*routev3.VirtualHost, 0, len(names))
+// buildHTTPSRouteConfiguration builds the RDS route configuration. Routes are
+// grouped into virtual hosts by their effective host:
+//
+//   - A rule-based route is served by the virtual host of its rule's first
+//     Host(...) atom (Hosts() is sorted, so this is deterministic). This is
+//     what lets several routes (routers) share one host and be evaluated by
+//     precedence.
+//   - A legacy subdomain-only route (no rule) keeps the existing behavior:
+//     its own virtual host <subdomain>.<baseDomain> with a catch-all route.
+//
+// Within a virtual host, routes are ordered by model.SortByPrecedence (the
+// deterministic precedence: explicit priority, then rule specificity, then
+// router name), because Envoy evaluates routes top-to-bottom and the first
+// match wins.
+//
+// When any rule-based route exists, a final catch-all virtual host with
+// domain "*" carries the legacy subdomain routes, so a request that matches
+// no rule-based virtual host still reaches the legacy catch-all routes.
+// Without rule-based routes the configuration is exactly the legacy shape
+// (one virtual host per subdomain, no catch-all), preserving backward
+// compatibility.
+func buildHTTPSRouteConfiguration(routes map[string]model.Route, names []string, baseDomain string, logger *slog.Logger) *routev3.RouteConfiguration {
+	byHost := map[string][]model.Route{}
+	var legacy []model.Route
 	for _, name := range names {
-		vhosts = append(vhosts, buildVirtualHost(routes[name], baseDomain))
+		route := routes[name]
+		if route.Rule.Node == nil {
+			legacy = append(legacy, route)
+			continue
+		}
+		hosts := route.Rule.Hosts()
+		host := subdomainHost(route, baseDomain)
+		if len(hosts) > 0 {
+			host = hosts[0]
+		}
+		byHost[host] = append(byHost[host], route)
 	}
+
+	vhosts := make([]*routev3.VirtualHost, 0, len(byHost)+1+len(legacy))
+	hostNames := make([]string, 0, len(byHost))
+	for h := range byHost {
+		hostNames = append(hostNames, h)
+	}
+	sort.Strings(hostNames)
+	for _, h := range hostNames {
+		vh := buildVirtualHost(h, model.SortByPrecedence(byHost[h]), logger)
+		if vh != nil {
+			vhosts = append(vhosts, vh)
+		}
+	}
+
+	if len(byHost) > 0 {
+		// Legacy subdomain routes move into the catch-all virtual host so
+		// they are evaluated after every rule-based virtual host.
+		catchAll := buildVirtualHost(catchAllDomain, model.SortByPrecedence(legacy), logger)
+		if catchAll != nil {
+			catchAll.Name = catchAllVHName
+			vhosts = append(vhosts, catchAll)
+		}
+	} else {
+		// No rule-based routes: the legacy shape, one virtual host per
+		// subdomain, each with its catch-all route.
+		for _, route := range legacy {
+			vh := buildVirtualHost(subdomainHost(route, baseDomain), []model.Route{route}, logger)
+			if vh != nil {
+				vhosts = append(vhosts, vh)
+			}
+		}
+	}
+
 	return &routev3.RouteConfiguration{
 		Name:         httpsRouteConfigName,
 		VirtualHosts: vhosts,
 	}
 }
 
-func buildVirtualHost(route model.Route, baseDomain string) *routev3.VirtualHost {
-	host := route.Subdomain + "." + baseDomain
+// catchAllVHName is the internal name of the catch-all virtual host;
+// catchAllDomain is its domain: a literal "*" matches every host that no
+// rule-based virtual host claimed.
+const (
+	catchAllVHName = "catch_all"
+	catchAllDomain = "*"
+)
+
+// subdomainHost returns the legacy virtual host domain for a route:
+// <subdomain>.<baseDomain>.
+func subdomainHost(route model.Route, baseDomain string) string {
+	return route.Subdomain + "." + baseDomain
+}
+
+// buildVirtualHost builds one Envoy virtual host. Its routes are the given
+// routes (already ordered by precedence); each contributes one or more
+// generated routes (one per DNF term) pointing at its own cluster. Routes
+// whose rule cannot be translated to an Envoy route match (ClientIP, negation
+// on a non-header matcher, pathological DNF) are skipped with an actionable
+// warning when logger is non-nil, so one bad router never breaks the host.
+func buildVirtualHost(domain string, routes []model.Route, logger *slog.Logger) *routev3.VirtualHost {
+	var vhRoutes []*routev3.Route
+	for _, route := range routes {
+		generated := buildRoutesForRoute(route, logger)
+		if generated == nil {
+			continue
+		}
+		vhRoutes = append(vhRoutes, generated...)
+	}
+	if len(vhRoutes) == 0 {
+		return nil
+	}
 	return &routev3.VirtualHost{
-		Name:    route.ClusterName(),
-		Domains: []string{host},
-		Routes: []*routev3.Route{
+		Name:    domain,
+		Domains: []string{domain},
+		Routes:  vhRoutes,
+	}
+}
+
+// buildRoutesForRoute derives the Envoy routes for one model.Route. It
+// returns nil (meaning: skip this subdomain's virtual host) when the rule
+// cannot be translated, and emits a warning via logger when provided.
+func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Route {
+	// Legacy: no rule -> single catch-all prefix "/" route.
+	if route.Rule.Node == nil {
+		return []*routev3.Route{
 			{
 				Match: &routev3.RouteMatch{
 					PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
@@ -163,8 +278,183 @@ func buildVirtualHost(route model.Route, baseDomain string) *routev3.VirtualHost
 					},
 				},
 			},
-		},
+		}
 	}
+
+	// Reject rules that cannot be expressed as Envoy route matches.
+	if err := route.Rule.Translatable(); err != nil {
+		if logger != nil {
+			logger.Warn("skipping subdomain: rule cannot be translated to an Envoy route match",
+				"subdomain", route.Subdomain, "origin", route.Origin, "rule", route.RuleExpr, "error", err)
+		}
+		return nil
+	}
+
+	terms, err := route.Rule.ToDNF()
+	if err != nil {
+		if logger != nil {
+			logger.Warn("skipping subdomain: rule DNF expansion failed",
+				"subdomain", route.Subdomain, "origin", route.Origin, "rule", route.RuleExpr, "error", err)
+		}
+		return nil
+	}
+
+	// Order the generated routes most-specific-first. Envoy evaluates routes
+	// within a virtual host top-to-bottom with first-match-wins, so a broader
+	// term (e.g. PathPrefix(/)) must not precede a narrower one it would
+	// otherwise shadow (e.g. Path(/api)). This is the deterministic
+	// precedence the task requires, applied at the xDS layer.
+	terms = orderDNFTerms(terms)
+
+	out := make([]*routev3.Route, 0, len(terms))
+	for i, term := range terms {
+		match, err := buildRouteMatchFromTerm(term)
+		if err != nil {
+			if logger != nil {
+				logger.Warn("skipping subdomain: DNF term cannot be translated",
+					"subdomain", route.Subdomain, "origin", route.Origin, "rule", route.RuleExpr,
+					"term", i, "error", err)
+			}
+			return nil
+		}
+		out = append(out, &routev3.Route{
+			Match: match,
+			Action: &routev3.Route_Route{
+				Route: &routev3.RouteAction{
+					ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: route.ClusterName()},
+				},
+			},
+		})
+	}
+	return out
+}
+
+// orderDNFTerms returns the terms sorted so the most specific term comes
+// first, the order Envoy must evaluate them in (first match wins). Specificity
+// is the number of atoms in the term (more constraints = more specific); ties
+// are broken by the term's canonical string for a stable, deterministic order.
+// The input slice is not mutated.
+func orderDNFTerms(terms []model.DNFTerm) []model.DNFTerm {
+	out := make([]model.DNFTerm, len(terms))
+	copy(out, terms)
+	sort.SliceStable(out, func(i, j int) bool {
+		if len(out[i]) != len(out[j]) {
+			return len(out[i]) > len(out[j])
+		}
+		return termString(out[i]) < termString(out[j])
+	})
+	return out
+}
+
+// termString renders a DNF term (a conjunction of atoms) deterministically for
+// use as a tie-breaker in route ordering.
+func termString(term model.DNFTerm) string {
+	var b strings.Builder
+	for i, e := range term {
+		if i > 0 {
+			b.WriteString(" && ")
+		}
+		if e.Negated {
+			b.WriteString("!")
+		}
+		b.WriteString(e.Atom.String())
+	}
+	return b.String()
+}
+
+// buildRouteMatchFromTerm translates one DNF term (a conjunction of possibly
+// negated atoms) into an Envoy RouteMatch. Non-path atoms become header or
+// query matchers; the path (or prefix) becomes the RouteMatch path specifier.
+// A term with no path specifier defaults to prefix "/".
+//
+// Host atoms are not emitted as route matchers: Envoy matches the request
+// Host at the virtual-host level (via the virtual host's domains), and this
+// control plane already scopes each subdomain to its own virtual host
+// (<subdomain>.<baseDomain>). A Host(...) atom inside a rule is therefore
+// satisfied by the virtual host's domain match and is redundant at the route
+// level. (Host matching is case-insensitive, as required.)
+func buildRouteMatchFromTerm(term model.DNFTerm) (*routev3.RouteMatch, error) {
+	match := &routev3.RouteMatch{}
+
+	var path, pathPrefix string
+	headerMatchers := make([]*routev3.HeaderMatcher, 0, len(term))
+	queryMatchers := make([]*routev3.QueryParameterMatcher, 0, len(term))
+
+	for _, e := range term {
+		switch e.Atom.Kind {
+		case model.KindHost:
+			// Satisfied by the virtual host domain; no route-level matcher.
+		case model.KindPath:
+			path = e.Atom.Value
+		case model.KindPathPrefix:
+			pathPrefix = e.Atom.Value
+		case model.KindHeader:
+			hm := &routev3.HeaderMatcher{
+				Name: e.Atom.Name,
+				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
+					StringMatch: &matcher.StringMatcher{
+						MatchPattern: &matcher.StringMatcher_Exact{Exact: e.Atom.Value},
+					},
+				},
+			}
+			if e.Negated {
+				hm.InvertMatch = true
+				hm.TreatMissingHeaderAsEmpty = true
+			}
+			headerMatchers = append(headerMatchers, hm)
+		case model.KindMethod:
+			hm := &routev3.HeaderMatcher{
+				Name: ":method",
+				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
+					StringMatch: &matcher.StringMatcher{
+						MatchPattern: &matcher.StringMatcher_Exact{Exact: e.Atom.Value},
+					},
+				},
+			}
+			if e.Negated {
+				hm.InvertMatch = true
+				hm.TreatMissingHeaderAsEmpty = true
+			}
+			headerMatchers = append(headerMatchers, hm)
+		case model.KindQuery:
+			qm := &routev3.QueryParameterMatcher{Name: e.Atom.Name}
+			if e.Negated {
+				return nil, fmt.Errorf("negation on Query(%s) is not supported", e.Atom.Name)
+			}
+			if e.Atom.Value == "" {
+				// Presence match: the parameter is present (any value).
+				qm.QueryParameterMatchSpecifier = &routev3.QueryParameterMatcher_PresentMatch{PresentMatch: true}
+			} else {
+				qm.QueryParameterMatchSpecifier = &routev3.QueryParameterMatcher_StringMatch{
+					StringMatch: &matcher.StringMatcher{
+						MatchPattern: &matcher.StringMatcher_Exact{Exact: e.Atom.Value},
+					},
+				}
+			}
+			queryMatchers = append(queryMatchers, qm)
+		case model.KindClientIP:
+			return nil, fmt.Errorf("ClientIP(%s) cannot be expressed as an Envoy route match in this version", e.Atom.Value)
+		}
+	}
+
+	// Path specifier: an exact Path wins over a PathPrefix (the exact path is
+	// strictly more specific and subsumes the prefix when both hold).
+	switch {
+	case path != "":
+		match.PathSpecifier = &routev3.RouteMatch_Path{Path: path}
+	case pathPrefix != "":
+		match.PathSpecifier = &routev3.RouteMatch_Prefix{Prefix: pathPrefix}
+	default:
+		match.PathSpecifier = &routev3.RouteMatch_Prefix{Prefix: "/"}
+	}
+
+	if len(headerMatchers) > 0 {
+		match.Headers = headerMatchers
+	}
+	if len(queryMatchers) > 0 {
+		match.QueryParameters = queryMatchers
+	}
+	return match, nil
 }
 
 // buildHTTPListener returns the plain-HTTP listener that unconditionally

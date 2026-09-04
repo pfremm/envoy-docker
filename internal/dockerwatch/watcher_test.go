@@ -1,10 +1,14 @@
 package dockerwatch
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
+
+	"github.com/bryanpfremm/envoy-control-plane/internal/model"
+	"github.com/bryanpfremm/envoy-control-plane/internal/rule"
 )
 
 func TestParseRouters(t *testing.T) {
@@ -12,6 +16,7 @@ func TestParseRouters(t *testing.T) {
 		name    string
 		labels  map[string]string
 		want    map[string]parsedRouter
+		wantBad []string // router names expected in badRouters
 		wantErr bool
 	}{
 		{
@@ -50,26 +55,44 @@ func TestParseRouters(t *testing.T) {
 			},
 		},
 		{
-			name: "missing subdomain",
+			name: "missing subdomain rejects only that router",
 			labels: map[string]string{
-				"envoy.http.routers.web.port": "8080",
+				"envoy.http.routers.web.port":     "8080",
+				"envoy.http.routers.ok.subdomain": "fine",
+				"envoy.http.routers.ok.port":      "8081",
 			},
-			wantErr: true,
+			want:    map[string]parsedRouter{"ok": {subdomain: "fine", port: 8081}},
+			wantBad: []string{"web"},
 		},
 		{
-			name: "missing port",
+			name: "missing port rejects only that router",
 			labels: map[string]string{
 				"envoy.http.routers.web.subdomain": "myapp",
 			},
-			wantErr: true,
+			wantBad: []string{"web"},
 		},
 		{
-			name: "invalid port",
+			name: "invalid port rejects only that router",
 			labels: map[string]string{
 				"envoy.http.routers.web.subdomain": "myapp",
 				"envoy.http.routers.web.port":      "not-a-port",
+				"envoy.http.routers.ok.subdomain":  "fine",
+				"envoy.http.routers.ok.port":       "8081",
 			},
-			wantErr: true,
+			want:    map[string]parsedRouter{"ok": {subdomain: "fine", port: 8081}},
+			wantBad: []string{"web"},
+		},
+		{
+			name: "invalid priority rejects only that router",
+			labels: map[string]string{
+				"envoy.http.routers.web.subdomain": "myapp",
+				"envoy.http.routers.web.port":      "8080",
+				"envoy.http.routers.web.priority":  "not-an-int",
+				"envoy.http.routers.ok.subdomain":  "fine",
+				"envoy.http.routers.ok.port":       "8081",
+			},
+			want:    map[string]parsedRouter{"ok": {subdomain: "fine", port: 8081}},
+			wantBad: []string{"web"},
 		},
 		{
 			name:   "no router labels",
@@ -92,7 +115,7 @@ func TestParseRouters(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseRouters(tt.labels)
+			got, bad, err := parseRouters(tt.labels)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("parseRouters() expected error, got nil (result: %+v)", got)
@@ -101,6 +124,14 @@ func TestParseRouters(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("parseRouters() unexpected error: %v", err)
+			}
+			if len(bad) != len(tt.wantBad) {
+				t.Fatalf("parseRouters() badRouters = %v, want %v", bad, tt.wantBad)
+			}
+			for _, name := range tt.wantBad {
+				if _, ok := bad[name]; !ok {
+					t.Errorf("parseRouters() badRouters missing %q, got %v", name, bad)
+				}
 			}
 			if len(got) != len(tt.want) {
 				t.Fatalf("parseRouters() = %+v, want %+v", got, tt.want)
@@ -115,6 +146,99 @@ func TestParseRouters(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestParseRouters_RuleAndPriority(t *testing.T) {
+	got, _, err := parseRouters(map[string]string{
+		"envoy.enable":                     "true",
+		"envoy.http.routers.web.subdomain": "myapp",
+		"envoy.http.routers.web.port":      "8080",
+		"envoy.http.routers.web.rule":      "Host(myapp.example.com) && PathPrefix(/api)",
+		"envoy.http.routers.web.priority":  "42",
+	})
+	if err != nil {
+		t.Fatalf("parseRouters() unexpected error: %v", err)
+	}
+	r := got["web"]
+	if r.ruleExpr != "Host(myapp.example.com) && PathPrefix(/api)" {
+		t.Errorf("ruleExpr = %q, want the rule expression", r.ruleExpr)
+	}
+	if r.priority != 42 || !r.prioritySet {
+		t.Errorf("priority = %d (set=%v), want 42 (set=true)", r.priority, r.prioritySet)
+	}
+	// parseRouters stores the raw expression; the AST is built in scan().
+	// Verify the expression is parseable by the rule package.
+	if _, perr := rule.Parse(r.ruleExpr); perr != nil {
+		t.Errorf("rule.Parse(%q) error: %v", r.ruleExpr, perr)
+	}
+}
+
+func TestParseRouters_RuleOnlyNoPriority(t *testing.T) {
+	got, _, err := parseRouters(map[string]string{
+		"envoy.http.routers.web.subdomain": "myapp",
+		"envoy.http.routers.web.port":      "8080",
+		"envoy.http.routers.web.rule":      "Method(GET)",
+	})
+	if err != nil {
+		t.Fatalf("parseRouters() unexpected error: %v", err)
+	}
+	r := got["web"]
+	if r.prioritySet {
+		t.Errorf("prioritySet = true, want false (no priority label)")
+	}
+	if r.ruleExpr != "Method(GET)" {
+		t.Errorf("ruleExpr = %q, want Method(GET)", r.ruleExpr)
+	}
+}
+
+func TestParseRouters_InvalidPriority(t *testing.T) {
+	// An invalid priority rejects only that router, with an actionable
+	// message; the sibling router is unaffected.
+	got, bad, err := parseRouters(map[string]string{
+		"envoy.http.routers.web.subdomain": "myapp",
+		"envoy.http.routers.web.port":      "8080",
+		"envoy.http.routers.web.priority":  "not-an-int",
+		"envoy.http.routers.ok.subdomain":  "fine",
+		"envoy.http.routers.ok.port":       "8081",
+	})
+	if err != nil {
+		t.Fatalf("parseRouters() unexpected error: %v", err)
+	}
+	if _, ok := bad["web"]; !ok {
+		t.Fatalf("expected router %q in badRouters, got %v", "web", bad)
+	}
+	if msg := bad["web"].Error(); !strings.Contains(msg, "priority") {
+		t.Errorf("badRouters[web] = %q, want an actionable message mentioning priority", msg)
+	}
+	if _, ok := got["ok"]; !ok {
+		t.Errorf("sibling router %q should still be parsed, got %v", "ok", got)
+	}
+	if _, ok := got["web"]; ok {
+		t.Errorf("router %q should be rejected, got %v", "web", got)
+	}
+}
+
+func TestMergeDecision(t *testing.T) {
+	// No existing route: add.
+	if a, _ := mergeDecision(model.Route{}, false, "Host(a)", "o1"); a != mergeAdd {
+		t.Errorf("new subdomain action = %v, want mergeAdd", a)
+	}
+	// Same rule: merge as a replica.
+	existing := model.Route{RuleExpr: "Host(a)", Origin: "c1/web"}
+	if a, _ := mergeDecision(existing, true, "Host(a)", "c2/web"); a != mergeMerge {
+		t.Errorf("same-rule action = %v, want mergeMerge", a)
+	}
+	// Different rule: skip (conflict).
+	if a, msg := mergeDecision(existing, true, "Path(/x)", "c2/web"); a != mergeSkip {
+		t.Errorf("different-rule action = %v, want mergeSkip", a)
+	} else if msg == "" {
+		t.Error("conflict message should be non-empty")
+	}
+	// Both legacy (no rule): merge as replicas.
+	legacy := model.Route{Origin: "c1/web"}
+	if a, _ := mergeDecision(legacy, true, "", "c2/web"); a != mergeMerge {
+		t.Errorf("two legacy routers action = %v, want mergeMerge", a)
 	}
 }
 

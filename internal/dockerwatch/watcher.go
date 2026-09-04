@@ -18,6 +18,7 @@ import (
 	"github.com/docker/docker/client"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
+	"github.com/bryanpfremm/envoy-control-plane/internal/rule"
 )
 
 const (
@@ -128,13 +129,51 @@ func (w *Watcher) scan(ctx context.Context) (map[string]model.Route, error) {
 			continue
 		}
 
-		routers, err := parseRouters(c.Labels)
+		routers, badRouters, err := parseRouters(c.Labels)
 		if err != nil {
 			w.logger.Warn("skipping container with invalid envoy labels", "container", name, "error", err)
 			continue
 		}
 
-		for routerName, r := range routers {
+		// Routers rejected on their own (invalid priority/port, missing
+		// subdomain): log and skip them individually; the rest of the
+		// container's routers are unaffected.
+		badNames := make([]string, 0, len(badRouters))
+		for rn := range badRouters {
+			badNames = append(badNames, rn)
+		}
+		sort.Strings(badNames)
+		for _, rn := range badNames {
+			w.logger.Warn("skipping router: invalid envoy labels",
+				"container", name, "router", rn, "error", badRouters[rn])
+		}
+
+		// Deterministic router iteration order so merge-conflict resolution
+		// and log output are stable across scans.
+		routerNames := make([]string, 0, len(routers))
+		for rn := range routers {
+			routerNames = append(routerNames, rn)
+		}
+		sort.Strings(routerNames)
+
+		for _, routerName := range routerNames {
+			r := routers[routerName]
+
+			// Parse the rule expression (if any) into the typed AST. A bad
+			// rule rejects only this router, with an actionable log; the
+			// rest of the container's routers are unaffected.
+			if r.ruleExpr != "" {
+				parsed, perr := rule.Parse(r.ruleExpr)
+				if perr != nil {
+					w.logger.Warn("skipping router: invalid rule expression",
+						"container", name, "router", routerName,
+						"rule", r.ruleExpr, "error", perr,
+						"hint", "check the rule grammar in docs/LABELS.md (matchers: Host, Path, PathPrefix, Headers, Method, Query, ClientIP; operators: &&, ||, !, parentheses)")
+					continue
+				}
+				r.rule = parsed
+			}
+
 			network := r.network
 			if network == "" {
 				network = w.defaultNetwork
@@ -155,11 +194,14 @@ func (w *Watcher) scan(ctx context.Context) (map[string]model.Route, error) {
 			endpoint := model.Endpoint{Address: addr, Port: r.port}
 			origin := name + "/" + routerName
 
-			// Multiple containers advertising the same subdomain are treated
-			// as replicas of the same route and merged into one multi-
-			// endpoint route (basic round robin), matching Traefik's
-			// behavior when a compose service is scaled.
-			if existing, ok := routes[r.subdomain]; ok {
+			existing, exists := routes[r.subdomain]
+			if action, msg := mergeDecision(existing, exists, r.ruleExpr, origin); action == mergeSkip {
+				w.logger.Warn("skipping router: "+msg,
+					"container", name, "router", routerName, "subdomain", r.subdomain)
+				continue
+			}
+
+			if exists {
 				existing.Endpoints = append(existing.Endpoints, endpoint)
 				existing.Origin = existing.Origin + "," + origin
 				routes[r.subdomain] = existing
@@ -167,10 +209,15 @@ func (w *Watcher) scan(ctx context.Context) (map[string]model.Route, error) {
 			}
 
 			routes[r.subdomain] = model.Route{
-				Subdomain: r.subdomain,
-				Endpoints: []model.Endpoint{endpoint},
-				Source:    model.SourceDocker,
-				Origin:    origin,
+				Subdomain:   r.subdomain,
+				Endpoints:   []model.Endpoint{endpoint},
+				Source:      model.SourceDocker,
+				Origin:      origin,
+				Rule:        r.rule,
+				RuleExpr:    r.ruleExpr,
+				Priority:    r.priority,
+				PrioritySet: r.prioritySet,
+				RouterName:  routerName,
 			}
 		}
 	}
@@ -178,17 +225,62 @@ func (w *Watcher) scan(ctx context.Context) (map[string]model.Route, error) {
 	return routes, nil
 }
 
+type mergeAction int
+
+const (
+	mergeAdd   mergeAction = iota // no existing route: add a new one
+	mergeMerge                    // same rule: merge as a replica
+	mergeSkip                     // conflicting rule: reject this router
+)
+
+// mergeDecision decides how a new router for an already-seen subdomain is
+// handled. Multiple containers advertising the same subdomain with the same
+// rule are replicas of one route and merge into a multi-endpoint route
+// (basic round robin), matching Traefik's behavior when a compose service is
+// scaled. A different rule on the same subdomain is a configuration conflict:
+// the later router is rejected rather than guessing which intent wins.
+func mergeDecision(existing model.Route, exists bool, newRuleExpr, newOrigin string) (mergeAction, string) {
+	if !exists {
+		return mergeAdd, ""
+	}
+	if existing.RuleExpr != newRuleExpr {
+		return mergeSkip, fmt.Sprintf(
+			"subdomain already claimed by a different rule (existing %q from %s, new %q from %s); use different subdomains, or make the rules identical so the routers merge as replicas",
+			existing.RuleExpr, existing.Origin, newRuleExpr, newOrigin)
+	}
+	return mergeMerge, ""
+}
+
 type parsedRouter struct {
 	subdomain string
 	port      uint32
 	network   string
+	// ruleExpr is the raw rule expression ("" for legacy subdomain-only
+	// routers). rule is its parsed form.
+	ruleExpr string
+	rule     model.Rule
+	// priority is the explicit integer priority (0 with prioritySet=false
+	// when the label is absent).
+	priority    int
+	prioritySet bool
 }
 
-// parseRouters extracts envoy.http.routers.<name>.{subdomain,port,network}
-// labels into one parsedRouter per <name>, validating that each has the
-// required fields.
-func parseRouters(labels map[string]string) (map[string]parsedRouter, error) {
+// parseRouters extracts envoy.http.routers.<name>.{subdomain,port,network,
+// rule,priority} labels into one parsedRouter per <name>.
+//
+// It returns (routers, badRouters, err):
+//
+//   - routers: the valid routers, ready to be turned into routes.
+//   - badRouters: a name -> error map for routers that were rejected on
+//     their own (an invalid priority value, or missing subdomain/port).
+//     Callers log these and skip only the affected router; the rest of the
+//     container's routers are unaffected.
+//   - err: non-nil only for a structurally broken label set (no router at
+//     all, or a label that cannot be attributed to a single router), which
+//     the caller should treat as "skip the whole container".
+func parseRouters(labels map[string]string) (map[string]parsedRouter, map[string]error, error) {
 	routers := map[string]parsedRouter{}
+	badRouters := map[string]error{}
 
 	for key, value := range labels {
 		if !strings.HasPrefix(key, routerPrefix) {
@@ -199,6 +291,9 @@ func parseRouters(labels map[string]string) (map[string]parsedRouter, error) {
 		if !ok {
 			continue
 		}
+		if name == "" {
+			return nil, nil, fmt.Errorf("router label %q has an empty router name", key)
+		}
 
 		r := routers[name]
 		switch field {
@@ -207,11 +302,30 @@ func parseRouters(labels map[string]string) (map[string]parsedRouter, error) {
 		case "port":
 			p, err := strconv.ParseUint(value, 10, 16)
 			if err != nil {
-				return nil, fmt.Errorf("router %q: invalid port %q: %w", name, value, err)
+				// An invalid port belongs to this router only: reject it
+				// individually rather than the whole container.
+				badRouters[name] = fmt.Errorf("router %q: invalid port %q (must be an integer 1-65535)", name, value)
+				continue
+			}
+			if p == 0 {
+				badRouters[name] = fmt.Errorf("router %q: port %q is out of range (must be 1-65535)", name, value)
+				continue
 			}
 			r.port = uint32(p)
 		case "network":
 			r.network = value
+		case "rule":
+			r.ruleExpr = value
+		case "priority":
+			p, err := strconv.Atoi(value)
+			if err != nil {
+				// An invalid priority belongs to this router only: reject it
+				// individually rather than the whole container.
+				badRouters[name] = fmt.Errorf("router %q: invalid priority %q (must be an integer)", name, value)
+				continue
+			}
+			r.priority = p
+			r.prioritySet = true
 		default:
 			continue
 		}
@@ -219,15 +333,21 @@ func parseRouters(labels map[string]string) (map[string]parsedRouter, error) {
 	}
 
 	for name, r := range routers {
-		if r.subdomain == "" {
-			return nil, fmt.Errorf("router %q missing %s%s.subdomain label", name, routerPrefix, name)
+		if _, bad := badRouters[name]; bad {
+			continue
 		}
-		if r.port == 0 {
-			return nil, fmt.Errorf("router %q missing %s%s.port label", name, routerPrefix, name)
+		if r.subdomain == "" {
+			badRouters[name] = fmt.Errorf("router %q missing %s%s.subdomain label", name, routerPrefix, name)
+		} else if r.port == 0 {
+			badRouters[name] = fmt.Errorf("router %q missing %s%s.port label", name, routerPrefix, name)
 		}
 	}
 
-	return routers, nil
+	for name := range badRouters {
+		delete(routers, name)
+	}
+
+	return routers, badRouters, nil
 }
 
 func containerName(c container.Summary) string {
