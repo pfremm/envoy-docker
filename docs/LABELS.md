@@ -27,6 +27,7 @@ number of routers.
 | `envoy.http.routers.<name>.network` | no | The Docker network to resolve the container's IP on. When omitted, the `DOCKER_NETWORK` environment variable is used. Named service definitions use the network of a referencing router on that container, falling back to `DOCKER_NETWORK`. |
 | `envoy.http.routers.<name>.rule` | no | A routing rule in the rule DSL (below). When absent the router is a legacy catch-all for its subdomain. |
 | `envoy.http.routers.<name>.priority` | no | An explicit integer priority that overrides rule-specificity ordering. See [Precedence](#precedence). |
+| `envoy.http.routers.<name>.middlewares` | no | Ordered comma/escape list of named HTTP middleware. See [HTTP middleware](#http-middleware). |
 | `envoy.http.routers.<name>.timeout` | no | Total upstream request timeout as a Go duration (`30s`, `500ms`). `0s` disables Envoy's route timeout. |
 | `envoy.http.routers.<name>.idletimeout` | no | Per-route stream idle timeout as a Go duration. `0s` disables it. |
 | `envoy.http.routers.<name>.retries.attempts` | no | Positive retry count. |
@@ -133,6 +134,101 @@ combined. Weighted services cannot define leaf-only protocol, health, outlier,
 or sticky policy, and cannot include a sticky child. Unknown children,
 overflow, and direct or indirect cycles invalidate the referencing weighted
 service and only its routers.
+
+### HTTP middleware
+
+A router references a named, ordered chain with:
+
+```yaml
+envoy.http.routers.web.middlewares: strip-api,internal-prefix,security-headers,cors
+```
+
+Definitions use `envoy.http.middlewares.<name>.<type>.*`. A name must define
+exactly one type. References are resolved after every enabled container has
+been parsed, so definitions may be on another container and label order does
+not matter. Unknown, invalid, conflicting, or multi-type definitions reject
+only routers that reference them. Middleware execution follows the router
+list from left to right; definitions and emitted header keys are sorted where
+map iteration would otherwise make xDS nondeterministic. A chain can contain
+at most one redirect, and it must be last because redirect is a terminal route
+action. `replacepathregex` is compiled through Envoy's native RE2 rewrite; to
+avoid silently changing regex semantics, a chain containing it cannot contain
+another path rewrite or redirect (headers and CORS may still accompany it).
+When CORS is composed with other middleware it must be last: request filters
+run in listed order and response filters unwind in reverse order, matching a
+standard middleware stack. Unsupported orderings reject only that router.
+
+| Type | Fields |
+| --- | --- |
+| `redirectscheme` | `scheme` (required), `port` (`1-65535`, optional), `permanent` (default `false`; 302 when false, 301 when true) |
+| `redirectregex` | `regex`, `replacement` (required), `permanent` (default `false`) |
+| `stripprefix` | `prefixes` (required list) |
+| `addprefix` | `prefix` (required path beginning with `/`) |
+| `replacepath` | `path` (required path beginning with `/`) |
+| `replacepathregex` | `regex`, `replacement` (required) |
+| `headers` | `request.<header>`, `response.<header>`, `removerequest`, `removeresponse` |
+| `cors` | `alloworigins` (required list), `allowmethods`, `allowheaders`, `exposeheaders`, `maxage`, `allowcredentials` |
+
+Regexes are validated when labels are parsed. Invalid expressions never reach
+xDS. Replacements accept Go/Traefik capture references (`$1` or `${1}`), which
+are translated to Envoy's RE2 substitution form; `$$` emits a literal dollar.
+In Docker Compose YAML, double the dollar again (`$$1` in the Compose source)
+so interpolation delivers `$1` to the container label. Header names are
+case-insensitive and canonicalized to lowercase.
+Pseudo-headers such as `:authority`, and syntactically invalid HTTP field
+names, are rejected rather than mutated.
+
+#### List syntax
+
+List-valued fields and the router `middlewares` chain accept comma-separated
+values. A literal comma is written `\,`; a literal backslash is written `\\`.
+Whitespace surrounding each item is trimmed. Empty items, unsupported escapes,
+and a dangling backslash are errors. For example:
+
+```yaml
+envoy.http.middlewares.strip.stripprefix.prefixes: '/api\,/literal,/v1'
+```
+
+is the two-item list `/api,/literal` and `/v1`.
+
+As an alternative, middleware list fields accept numeric indexed labels. The
+indices are sorted numerically and need not be contiguous:
+
+```yaml
+envoy.http.middlewares.site-cors.cors.alloworigins.2: https://app.example.com
+envoy.http.middlewares.site-cors.cors.alloworigins.10: https://admin.example.com
+envoy.http.middlewares.site-cors.cors.allowmethods: GET,POST,OPTIONS
+```
+
+Do not combine a base list label and indexed labels for the same field.
+Indexed syntax is accepted for `prefixes`, `removerequest`, `removeresponse`,
+`alloworigins`, `allowmethods`, `allowheaders`, and `exposeheaders`. Docker
+label maps cannot repeat an identical key, so indexing is the repeated-value
+form.
+
+#### Complete mutation example
+
+```yaml
+labels:
+  envoy.enable: "true"
+  envoy.http.routers.web.subdomain: myapp
+  envoy.http.routers.web.port: "8080"
+  envoy.http.routers.web.middlewares: strip-api,add-internal,response-headers,site-cors
+  envoy.http.middlewares.strip-api.stripprefix.prefixes: /api,/v1
+  envoy.http.middlewares.add-internal.addprefix.prefix: /internal
+  envoy.http.middlewares.response-headers.headers.request.X-Forwarded-App: myapp
+  envoy.http.middlewares.response-headers.headers.response.X-Content-Type-Options: nosniff
+  envoy.http.middlewares.response-headers.headers.removeresponse: Server,X-Powered-By
+  envoy.http.middlewares.site-cors.cors.alloworigins.0: https://app.example.com
+  envoy.http.middlewares.site-cors.cors.allowmethods: GET,POST,OPTIONS
+  envoy.http.middlewares.site-cors.cors.allowheaders: Content-Type,Authorization
+  envoy.http.middlewares.site-cors.cors.exposeheaders: X-Request-ID
+  envoy.http.middlewares.site-cors.cors.maxage: "600"
+  envoy.http.middlewares.site-cors.cors.allowcredentials: "true"
+```
+
+Routers without a `middlewares` label retain their existing route action and
+request/response behavior.
 
 ## The rule DSL
 

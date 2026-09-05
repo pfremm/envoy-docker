@@ -59,6 +59,10 @@ type Route struct {
 	Timeout     *time.Duration
 	IdleTimeout *time.Duration
 	Retry       *RetryPolicy
+	// MiddlewareNames preserves the router label's explicit chain. Middlewares
+	// contains the validated typed definitions in the same execution order.
+	MiddlewareNames []string
+	Middlewares     []Middleware
 	// DiscoveryNetwork records the effective Docker network so replica
 	// definitions with conflicting discovery policy are not silently merged.
 	DiscoveryNetwork string

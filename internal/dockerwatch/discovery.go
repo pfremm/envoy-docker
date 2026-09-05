@@ -259,6 +259,8 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 	parsed := make([]parsedContainer, 0, len(containers))
 	services := map[string]model.HTTPService{}
 	invalidServices := map[string]error{}
+	middlewares := map[string]model.Middleware{}
+	invalidMiddlewares := map[string]error{}
 	for _, c := range containers {
 		if c.Labels[enableLabel] != "true" {
 			continue
@@ -271,6 +273,28 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 		}
 		for rn, e := range badRouters {
 			logger.Warn("skipping router: invalid envoy labels", "container", name, "router", rn, "error", e)
+		}
+		defs, badDefs, err := parseMiddlewares(c.Labels)
+		if err != nil {
+			logger.Warn("skipping container with structurally invalid middleware labels", "container", name, "error", err)
+			continue
+		}
+		for mn, e := range badDefs {
+			invalidMiddlewares[mn] = e
+			delete(middlewares, mn)
+			logger.Warn("discarding invalid middleware", "container", name, "middleware", mn, "error", e)
+		}
+		for mn, def := range defs {
+			if _, bad := invalidMiddlewares[mn]; bad {
+				continue
+			}
+			if old, exists := middlewares[mn]; exists && !reflect.DeepEqual(old, def) {
+				invalidMiddlewares[mn] = fmt.Errorf("middleware %q has conflicting definitions", mn)
+				delete(middlewares, mn)
+				logger.Warn("discarding conflicting middleware", "container", name, "middleware", mn)
+			} else {
+				middlewares[mn] = def
+			}
 		}
 		drafts, badServices, err := parseServices(c.Labels)
 		if err != nil {
@@ -350,7 +374,7 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 		logger.Warn("discarding invalid service", "service", sn, "error", e)
 	}
 	// Validate references and cycles after every container has been parsed.
-	cfg := model.HTTPConfiguration{Routes: map[string]model.Route{}, Services: services}
+	cfg := model.HTTPConfiguration{Routes: map[string]model.Route{}, Services: services, Middlewares: middlewares}
 	for sn, s := range services {
 		if err := s.Validate(); err != nil {
 			invalidServices[sn] = err
@@ -378,6 +402,24 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 					continue
 				}
 			}
+			resolvedMiddlewares := make([]model.Middleware, 0, len(r.middlewares))
+			validChain := true
+			for _, mn := range r.middlewares {
+				def, ok := cfg.Middlewares[mn]
+				if !ok {
+					logger.Warn("skipping router: referenced middleware is unknown or invalid", "container", name, "router", rn, "middleware", mn, "error", invalidMiddlewares[mn])
+					validChain = false
+					break
+				}
+				resolvedMiddlewares = append(resolvedMiddlewares, def)
+			}
+			if !validChain {
+				continue
+			}
+			if err := model.ValidateMiddlewareChain(resolvedMiddlewares); err != nil {
+				logger.Warn("skipping router: invalid middleware chain", "container", name, "router", rn, "error", err)
+				continue
+			}
 			if r.ruleExpr != "" {
 				rr, e := rule.Parse(r.ruleExpr)
 				if e != nil {
@@ -390,7 +432,7 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 			if effectiveNetwork == "" {
 				effectiveNetwork = defaultNetwork
 			}
-			route := model.Route{Subdomain: r.subdomain, Source: model.SourceDocker, Origin: name + "/" + rn, Rule: r.rule, RuleExpr: r.ruleExpr, Priority: r.priority, PrioritySet: r.prioritySet, RouterName: rn, ServiceName: r.service, Timeout: r.timeout, IdleTimeout: r.idleTimeout, Retry: r.retry, DiscoveryNetwork: effectiveNetwork}
+			route := model.Route{Subdomain: r.subdomain, Source: model.SourceDocker, Origin: name + "/" + rn, Rule: r.rule, RuleExpr: r.ruleExpr, Priority: r.priority, PrioritySet: r.prioritySet, RouterName: rn, ServiceName: r.service, Timeout: r.timeout, IdleTimeout: r.idleTimeout, Retry: r.retry, MiddlewareNames: append([]string(nil), r.middlewares...), Middlewares: resolvedMiddlewares, DiscoveryNetwork: effectiveNetwork}
 			if r.service == "" {
 				addr, e := containerIP(pc.c, effectiveNetwork)
 				if e != nil {
@@ -428,6 +470,7 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 func routesCompatible(a, b model.Route) bool {
 	if a.RuleExpr != b.RuleExpr || a.ServiceName != b.ServiceName || a.Priority != b.Priority ||
 		a.PrioritySet != b.PrioritySet || a.RouterName != b.RouterName || a.DiscoveryNetwork != b.DiscoveryNetwork ||
+		!reflect.DeepEqual(a.MiddlewareNames, b.MiddlewareNames) ||
 		!reflect.DeepEqual(a.Timeout, b.Timeout) || !reflect.DeepEqual(a.IdleTimeout, b.IdleTimeout) || !reflect.DeepEqual(a.Retry, b.Retry) {
 		return false
 	}

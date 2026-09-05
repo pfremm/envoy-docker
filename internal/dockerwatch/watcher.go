@@ -151,6 +151,7 @@ type parsedRouter struct {
 	timeout     *time.Duration
 	idleTimeout *time.Duration
 	retry       *model.RetryPolicy
+	middlewares []string
 }
 
 // parseRouters extracts envoy.http.routers.<name>.{subdomain,port,network,
@@ -249,6 +250,13 @@ func parseRouters(labels map[string]string) (map[string]parsedRouter, map[string
 				r.retry = &model.RetryPolicy{}
 			}
 			r.retry.RetryOn = value
+		case "middlewares":
+			chain, err := splitEscapedList(key, value)
+			if err != nil {
+				badRouters[name] = err
+				continue
+			}
+			r.middlewares = chain
 		case "priority":
 			p, err := strconv.Atoi(value)
 			if err != nil {

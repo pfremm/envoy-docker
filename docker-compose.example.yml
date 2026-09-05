@@ -83,6 +83,11 @@ services:
       envoy.enable: "true"
       envoy.http.routers.web.subdomain: myapp
       envoy.http.routers.web.port: "80"
+      envoy.http.routers.web.middlewares: strip-api,app-prefix,secure-headers
+      envoy.http.middlewares.strip-api.stripprefix.prefixes: /api,/v1
+      envoy.http.middlewares.app-prefix.addprefix.prefix: /internal
+      envoy.http.middlewares.secure-headers.headers.response.X-Content-Type-Options: nosniff
+      envoy.http.middlewares.secure-headers.headers.removeresponse: Server
     networks:
       - proxy
 

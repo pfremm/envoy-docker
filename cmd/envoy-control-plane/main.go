@@ -77,7 +77,7 @@ func run(logger *slog.Logger) error {
 
 	applyUpdate := func(dockerConfig model.HTTPConfiguration) error {
 		merged := xds.Merge(dockerConfig.Routes, staticRoutes, logger)
-		httpConfig := model.HTTPConfiguration{Routes: merged, Services: dockerConfig.Services}
+		httpConfig := model.HTTPConfiguration{Routes: merged, Services: dockerConfig.Services, Middlewares: dockerConfig.Middlewares}
 		v := version.Add(1)
 		snap, err := xds.BuildSnapshotForConfig(strconv.FormatUint(v, 10), httpConfig, snapCfg)
 		if err != nil {

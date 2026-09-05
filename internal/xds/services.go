@@ -26,6 +26,32 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 	if httpCfg.Services == nil {
 		httpCfg.Services = map[string]model.HTTPService{}
 	}
+	if httpCfg.Middlewares == nil {
+		httpCfg.Middlewares = map[string]model.Middleware{}
+	}
+	for name, middleware := range httpCfg.Middlewares {
+		if middleware.Name != name {
+			return nil, fmt.Errorf("HTTP middleware map key %q does not match middleware name %q", name, middleware.Name)
+		}
+		if err := middleware.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid HTTP middleware %q: %w", name, err)
+		}
+	}
+	for key, route := range httpCfg.Routes {
+		if len(route.MiddlewareNames) == 0 {
+			continue
+		}
+		resolved := make([]model.Middleware, 0, len(route.MiddlewareNames))
+		for _, name := range route.MiddlewareNames {
+			middleware, ok := httpCfg.Middlewares[name]
+			if !ok {
+				return nil, fmt.Errorf("router %q references unknown middleware %q", route.RouterName, name)
+			}
+			resolved = append(resolved, middleware)
+		}
+		route.Middlewares = resolved
+		httpCfg.Routes[key] = route
+	}
 	for name, service := range httpCfg.Services {
 		if service.Name != name {
 			return nil, fmt.Errorf("HTTP service map key %q does not match service name %q", name, service.Name)
@@ -38,6 +64,9 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 		}
 	}
 	for _, route := range httpCfg.Routes {
+		if err := model.ValidateMiddlewareChain(route.Middlewares); err != nil {
+			return nil, fmt.Errorf("router %q has invalid middleware chain: %w", route.RouterName, err)
+		}
 		if route.Timeout != nil && *route.Timeout < 0 {
 			return nil, fmt.Errorf("router %q has a negative timeout", route.RouterName)
 		}
@@ -109,6 +138,9 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 				continue
 			}
 			er.Action = &routev3.Route_Route{Route: configuredRouteAction(r, httpCfg)}
+			if err := applyRouteMiddlewares(er, r.Middlewares); err != nil {
+				return nil, fmt.Errorf("router %q middleware compilation: %w", r.RouterName, err)
+			}
 		}
 	}
 

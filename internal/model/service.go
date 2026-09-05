@@ -130,8 +130,9 @@ type RetryPolicy struct {
 }
 
 type HTTPConfiguration struct {
-	Routes   map[string]Route
-	Services map[string]HTTPService
+	Routes      map[string]Route
+	Services    map[string]HTTPService
+	Middlewares map[string]Middleware
 }
 
 type ResolvedService struct {
