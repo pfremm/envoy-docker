@@ -2,7 +2,10 @@
 // watcher, the static config loader, and the xDS snapshot builder.
 package model
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Endpoint is a single backend address:port a route can be load balanced to.
 type Endpoint struct {
@@ -49,6 +52,16 @@ type Route struct {
 	// envoy.http.routers.<name>.*). Used as the stable tie-breaker in
 	// precedence ordering.
 	RouterName string
+
+	// ServiceName references a separately modeled named HTTP service. Empty
+	// preserves the legacy implicit service represented by Endpoints.
+	ServiceName string
+	Timeout     *time.Duration
+	IdleTimeout *time.Duration
+	Retry       *RetryPolicy
+	// DiscoveryNetwork records the effective Docker network so replica
+	// definitions with conflicting discovery policy are not silently merged.
+	DiscoveryNetwork string
 }
 
 func (r Route) String() string {

@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,7 +17,6 @@ import (
 	"github.com/docker/docker/client"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
-	"github.com/bryanpfremm/envoy-control-plane/internal/rule"
 )
 
 const (
@@ -58,7 +56,7 @@ func (w *Watcher) Close() error {
 // on updates whenever it changes: once at startup, on every container
 // lifecycle event, and periodically as a fallback in case an event is
 // missed. It blocks until ctx is cancelled, closing updates on return.
-func (w *Watcher) Run(ctx context.Context, updates chan<- map[string]model.Route) error {
+func (w *Watcher) Run(ctx context.Context, updates chan<- model.HTTPConfiguration) error {
 	defer close(updates)
 
 	resync := func() bool {
@@ -111,120 +109,6 @@ func (w *Watcher) Run(ctx context.Context, updates chan<- map[string]model.Route
 	}
 }
 
-// scan lists all containers and builds a full route map from their labels.
-func (w *Watcher) scan(ctx context.Context) (map[string]model.Route, error) {
-	containers, err := w.cli.ContainerList(ctx, container.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("listing containers: %w", err)
-	}
-
-	// Deterministic order so results are stable across scans.
-	sort.Slice(containers, func(i, j int) bool { return containers[i].ID < containers[j].ID })
-
-	routes := map[string]model.Route{}
-
-	for _, c := range containers {
-		name := containerName(c)
-		if c.Labels[enableLabel] != "true" {
-			continue
-		}
-
-		routers, badRouters, err := parseRouters(c.Labels)
-		if err != nil {
-			w.logger.Warn("skipping container with invalid envoy labels", "container", name, "error", err)
-			continue
-		}
-
-		// Routers rejected on their own (invalid priority/port, missing
-		// subdomain): log and skip them individually; the rest of the
-		// container's routers are unaffected.
-		badNames := make([]string, 0, len(badRouters))
-		for rn := range badRouters {
-			badNames = append(badNames, rn)
-		}
-		sort.Strings(badNames)
-		for _, rn := range badNames {
-			w.logger.Warn("skipping router: invalid envoy labels",
-				"container", name, "router", rn, "error", badRouters[rn])
-		}
-
-		// Deterministic router iteration order so merge-conflict resolution
-		// and log output are stable across scans.
-		routerNames := make([]string, 0, len(routers))
-		for rn := range routers {
-			routerNames = append(routerNames, rn)
-		}
-		sort.Strings(routerNames)
-
-		for _, routerName := range routerNames {
-			r := routers[routerName]
-
-			// Parse the rule expression (if any) into the typed AST. A bad
-			// rule rejects only this router, with an actionable log; the
-			// rest of the container's routers are unaffected.
-			if r.ruleExpr != "" {
-				parsed, perr := rule.Parse(r.ruleExpr)
-				if perr != nil {
-					w.logger.Warn("skipping router: invalid rule expression",
-						"container", name, "router", routerName,
-						"rule", r.ruleExpr, "error", perr,
-						"hint", "check the rule grammar in docs/LABELS.md (matchers: Host, Path, PathPrefix, Headers, Method, Query, ClientIP; operators: &&, ||, !, parentheses)")
-					continue
-				}
-				r.rule = parsed
-			}
-
-			network := r.network
-			if network == "" {
-				network = w.defaultNetwork
-			}
-			if network == "" {
-				w.logger.Warn("skipping router: no docker network configured (set DOCKER_NETWORK or the envoy.http.routers.<name>.network label)",
-					"container", name, "router", routerName)
-				continue
-			}
-
-			addr, err := containerIP(c, network)
-			if err != nil {
-				w.logger.Warn("skipping router: could not resolve container IP",
-					"container", name, "router", routerName, "network", network, "error", err)
-				continue
-			}
-
-			endpoint := model.Endpoint{Address: addr, Port: r.port}
-			origin := name + "/" + routerName
-
-			existing, exists := routes[r.subdomain]
-			if action, msg := mergeDecision(existing, exists, r.ruleExpr, origin); action == mergeSkip {
-				w.logger.Warn("skipping router: "+msg,
-					"container", name, "router", routerName, "subdomain", r.subdomain)
-				continue
-			}
-
-			if exists {
-				existing.Endpoints = append(existing.Endpoints, endpoint)
-				existing.Origin = existing.Origin + "," + origin
-				routes[r.subdomain] = existing
-				continue
-			}
-
-			routes[r.subdomain] = model.Route{
-				Subdomain:   r.subdomain,
-				Endpoints:   []model.Endpoint{endpoint},
-				Source:      model.SourceDocker,
-				Origin:      origin,
-				Rule:        r.rule,
-				RuleExpr:    r.ruleExpr,
-				Priority:    r.priority,
-				PrioritySet: r.prioritySet,
-				RouterName:  routerName,
-			}
-		}
-	}
-
-	return routes, nil
-}
-
 type mergeAction int
 
 const (
@@ -255,6 +139,7 @@ type parsedRouter struct {
 	subdomain string
 	port      uint32
 	network   string
+	service   string
 	// ruleExpr is the raw rule expression ("" for legacy subdomain-only
 	// routers). rule is its parsed form.
 	ruleExpr string
@@ -263,6 +148,9 @@ type parsedRouter struct {
 	// when the label is absent).
 	priority    int
 	prioritySet bool
+	timeout     *time.Duration
+	idleTimeout *time.Duration
+	retry       *model.RetryPolicy
 }
 
 // parseRouters extracts envoy.http.routers.<name>.{subdomain,port,network,
@@ -314,8 +202,53 @@ func parseRouters(labels map[string]string) (map[string]parsedRouter, map[string
 			r.port = uint32(p)
 		case "network":
 			r.network = value
+		case "service":
+			r.service = value
 		case "rule":
 			r.ruleExpr = value
+		case "timeout":
+			d, err := parseDurationLabel(key, value, true)
+			if err != nil {
+				badRouters[name] = err
+				continue
+			}
+			r.timeout = &d
+		case "idletimeout":
+			d, err := parseDurationLabel(key, value, true)
+			if err != nil {
+				badRouters[name] = err
+				continue
+			}
+			r.idleTimeout = &d
+		case "retries.attempts":
+			n, err := strconv.ParseUint(value, 10, 32)
+			if err != nil || n == 0 {
+				badRouters[name] = fmt.Errorf("router %q: invalid retries.attempts %q (must be a positive integer)", name, value)
+				continue
+			}
+			if r.retry == nil {
+				r.retry = &model.RetryPolicy{}
+			}
+			r.retry.Attempts = uint32(n)
+		case "retries.pertrytimeout":
+			d, err := parseDurationLabel(key, value, false)
+			if err != nil {
+				badRouters[name] = err
+				continue
+			}
+			if r.retry == nil {
+				r.retry = &model.RetryPolicy{}
+			}
+			r.retry.PerTryTimeout = d
+		case "retries.retryon":
+			if strings.TrimSpace(value) == "" {
+				badRouters[name] = fmt.Errorf("router %q: retries.retryon cannot be empty", name)
+				continue
+			}
+			if r.retry == nil {
+				r.retry = &model.RetryPolicy{}
+			}
+			r.retry.RetryOn = value
 		case "priority":
 			p, err := strconv.Atoi(value)
 			if err != nil {
@@ -336,10 +269,16 @@ func parseRouters(labels map[string]string) (map[string]parsedRouter, map[string
 		if _, bad := badRouters[name]; bad {
 			continue
 		}
+		if r.retry != nil && strings.TrimSpace(r.retry.RetryOn) == "" {
+			badRouters[name] = fmt.Errorf("router %q sets retry options but is missing %s%s.retries.retryon", name, routerPrefix, name)
+			continue
+		}
 		if r.subdomain == "" {
 			badRouters[name] = fmt.Errorf("router %q missing %s%s.subdomain label", name, routerPrefix, name)
-		} else if r.port == 0 {
-			badRouters[name] = fmt.Errorf("router %q missing %s%s.port label", name, routerPrefix, name)
+		} else if r.port != 0 && r.service != "" {
+			badRouters[name] = fmt.Errorf("router %q cannot set both %s%s.port and %s%s.service", name, routerPrefix, name, routerPrefix, name)
+		} else if r.port == 0 && r.service == "" {
+			badRouters[name] = fmt.Errorf("router %q must set either %s%s.port (legacy) or %s%s.service", name, routerPrefix, name, routerPrefix, name)
 		}
 	}
 
