@@ -88,11 +88,18 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 		}
 	}
 
+	routeConfig := buildHTTPSRouteConfiguration(httpCfg.Routes, sortedSubdomains(httpCfg.Routes), cfg.BaseDomain, nil)
+	published := publishedRoutes(httpCfg.Routes, routeConfig)
+	plan, err := planSecurity(published)
+	if err != nil {
+		return nil, fmt.Errorf("planning security middleware: %w", err)
+	}
+
 	clusterResources := []cachetypes.Resource{}
 	endpointResources := []cachetypes.Resource{}
 	clusterNames := map[string]string{}
-	for _, name := range sortedSubdomains(httpCfg.Routes) {
-		route := httpCfg.Routes[name]
+	for _, name := range sortedSubdomains(published) {
+		route := published[name]
 		if route.ServiceName != "" {
 			continue
 		}
@@ -121,11 +128,21 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 		clusterResources = append(clusterResources, buildServiceCluster(s))
 		endpointResources = append(endpointResources, buildServiceLoadAssignment(s))
 	}
+	for _, c := range plan.authClusters {
+		if prior, exists := clusterNames[c.Name]; exists {
+			return nil, fmt.Errorf("xDS cluster name %q collides between %s and a forwardauth service", c.Name, prior)
+		}
+		clusterNames[c.Name] = "forwardauth service"
+		clusterResources = append(clusterResources, c)
+	}
 
-	routeConfig := buildHTTPSRouteConfiguration(httpCfg.Routes, sortedSubdomains(httpCfg.Routes), cfg.BaseDomain, nil)
-	byCluster := map[string]model.Route{}
-	for _, r := range httpCfg.Routes {
-		byCluster[r.ClusterName()] = r
+	byRouteName := map[string]model.Route{}
+	for _, r := range published {
+		name := routeResourceName(r)
+		if prior, exists := byRouteName[name]; exists {
+			return nil, fmt.Errorf("xDS route name %q collides between routers %q and %q", name, prior.RouterName, r.RouterName)
+		}
+		byRouteName[name] = r
 	}
 	for _, vh := range routeConfig.VirtualHosts {
 		for _, er := range vh.Routes {
@@ -133,7 +150,7 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 			if old == nil {
 				continue
 			}
-			r, ok := byCluster[old.GetCluster()]
+			r, ok := byRouteName[er.Name]
 			if !ok {
 				continue
 			}
@@ -141,14 +158,16 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 			if err := applyRouteMiddlewares(er, r.Middlewares); err != nil {
 				return nil, fmt.Errorf("router %q middleware compilation: %w", r.RouterName, err)
 			}
+			applyRouteSecurity(er, r.Middlewares)
 		}
 	}
+	applySecurityDefaults(routeConfig, plan)
 
 	resources := map[resourcev3.Type][]cachetypes.Resource{
 		resourcev3.ClusterType:  clusterResources,
 		resourcev3.EndpointType: endpointResources,
 		resourcev3.RouteType:    {routeConfig},
-		resourcev3.ListenerType: {buildHTTPListener(cfg.HTTPPort), buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName)},
+		resourcev3.ListenerType: {buildHTTPListener(cfg.HTTPPort), buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName, plan)},
 	}
 	snap, err := cachev3.NewSnapshot(version, resources)
 	if err != nil {

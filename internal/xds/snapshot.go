@@ -18,6 +18,7 @@ import (
 	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	xffv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/original_ip_detection/xff/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	cachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
@@ -81,18 +82,37 @@ func BuildSnapshot(version string, routes map[string]model.Route, cfg Config) (c
 // skipped with an actionable warning instead of failing the whole snapshot.
 func BuildSnapshotWithLogger(version string, routes map[string]model.Route, cfg Config, logger *slog.Logger) (cachev3.ResourceSnapshot, error) {
 	names := sortedSubdomains(routes)
+	routeConfig := buildHTTPSRouteConfiguration(routes, names, cfg.BaseDomain, logger)
+	published := publishedRoutes(routes, routeConfig)
 
-	clusters := make([]cachetypes.Resource, 0, len(names))
+	plan, err := planSecurity(published)
+	if err != nil {
+		return nil, fmt.Errorf("planning security middleware: %w", err)
+	}
+
+	clusters := make([]cachetypes.Resource, 0, len(names)+len(plan.authClusters))
 	endpoints := make([]cachetypes.Resource, 0, len(names))
-	for _, name := range names {
-		route := routes[name]
+	clusterOwners := make(map[string]string, len(names)+len(plan.authClusters))
+	for _, name := range sortedSubdomains(published) {
+		route := published[name]
+		if owner, exists := clusterOwners[route.ClusterName()]; exists {
+			return nil, fmt.Errorf("xDS cluster name %q collides between %s and application route %q", route.ClusterName(), owner, name)
+		}
+		clusterOwners[route.ClusterName()] = fmt.Sprintf("application route %q", name)
 		clusters = append(clusters, buildCluster(route.ClusterName()))
 		endpoints = append(endpoints, buildClusterLoadAssignment(route))
 	}
+	for _, c := range plan.authClusters {
+		if owner, exists := clusterOwners[c.Name]; exists {
+			return nil, fmt.Errorf("xDS cluster name %q collides between %s and a forwardauth service", c.Name, owner)
+		}
+		clusterOwners[c.Name] = "forwardauth service"
+		clusters = append(clusters, c)
+	}
 
 	httpListener := buildHTTPListener(cfg.HTTPPort)
-	httpsListener := buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName)
-	routeConfig := buildHTTPSRouteConfiguration(routes, names, cfg.BaseDomain, logger)
+	httpsListener := buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName, plan)
+	applySecurityDefaults(routeConfig, plan)
 
 	resources := map[resourcev3.Type][]cachetypes.Resource{
 		resourcev3.ClusterType:  clusters,
@@ -271,6 +291,7 @@ func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Rout
 	// Legacy: no rule -> single catch-all prefix "/" route.
 	if route.Rule.Node == nil {
 		er := &routev3.Route{
+			Name: routeResourceName(route),
 			Match: &routev3.RouteMatch{
 				PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
 			},
@@ -286,6 +307,7 @@ func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Rout
 			}
 			return nil
 		}
+		applyRouteSecurity(er, route.Middlewares)
 		return []*routev3.Route{er}
 	}
 
@@ -326,6 +348,7 @@ func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Rout
 			return nil
 		}
 		er := &routev3.Route{
+			Name:  routeResourceName(route),
 			Match: match,
 			Action: &routev3.Route_Route{
 				Route: &routev3.RouteAction{
@@ -339,9 +362,33 @@ func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Rout
 			}
 			return nil
 		}
+		applyRouteSecurity(er, route.Middlewares)
 		out = append(out, er)
 	}
 	return out
+}
+
+func routeResourceName(route model.Route) string {
+	if route.RouterName != "" {
+		return route.RouterName
+	}
+	return route.Subdomain
+}
+
+func publishedRoutes(routes map[string]model.Route, rc *routev3.RouteConfiguration) map[string]model.Route {
+	publishedNames := map[string]struct{}{}
+	for _, vh := range rc.VirtualHosts {
+		for _, er := range vh.Routes {
+			publishedNames[er.Name] = struct{}{}
+		}
+	}
+	published := make(map[string]model.Route, len(publishedNames))
+	for key, route := range routes {
+		if _, ok := publishedNames[routeResourceName(route)]; ok {
+			published[key] = route
+		}
+	}
+	return published
 }
 
 // orderDNFTerms returns the terms sorted so the most specific term comes
@@ -523,7 +570,33 @@ func buildHTTPListener(port uint32) *listenerv3.Listener {
 // Its routes come from RDS (dynamic, via ADS); its certificate comes from
 // SDS served by the separate envoy-acme control plane, referenced here only
 // by cluster name + secret name.
-func buildHTTPSListener(port uint32, certSecretName, acmeSDSClusterName string) *listenerv3.Listener {
+func buildHTTPSListener(port uint32, certSecretName, acmeSDSClusterName string, plan *securityPlan) *listenerv3.Listener {
+	filters := make([]*hcmv3.HttpFilter, 0, 3+len(plan.listenerFilters))
+	var extAuthzFilter, basicAuthRemoveFilter *hcmv3.HttpFilter
+	for _, filter := range plan.listenerFilters {
+		switch filter.Name {
+		case extAuthzFilterName:
+			extAuthzFilter = filter
+		case basicAuthRemoveFilterName:
+			basicAuthRemoveFilter = filter
+		default:
+			filters = append(filters, filter)
+		}
+	}
+	// Request mutations precede ForwardAuth so the authorization decision is
+	// made against exactly the path and headers the upstream would receive.
+	filters = append(filters, mutationHTTPFilter())
+	if extAuthzFilter != nil {
+		filters = append(filters, extAuthzFilter)
+	}
+	// BasicAuth credential cleanup must run after every auth filter but before
+	// CORS/router dispatch so removeheader cannot be undone by an earlier Lua
+	// mutation or hide credentials from ForwardAuth in a composed chain.
+	if basicAuthRemoveFilter != nil {
+		filters = append(filters, basicAuthRemoveFilter)
+	}
+	filters = append(filters, corsHTTPFilter(), routerHTTPFilter())
+
 	hcm := &hcmv3.HttpConnectionManager{
 		StatPrefix: "https",
 		RouteSpecifier: &hcmv3.HttpConnectionManager_Rds{
@@ -532,7 +605,21 @@ func buildHTTPSListener(port uint32, certSecretName, acmeSDSClusterName string) 
 				ConfigSource:    adsConfigSource(),
 			},
 		},
-		HttpFilters: []*hcmv3.HttpFilter{mutationHTTPFilter(), corsHTTPFilter(), routerHTTPFilter()},
+		HttpFilters: filters,
+	}
+	if plan.xffNumTrustedHops > 0 {
+		// Honor the ipstrategy.depth of the IP allow/deny middleware: trust
+		// that many X-Forwarded-For hops so RemoteIp-based RBAC principals
+		// resolve to the originating client, not the edge proxy.
+		hcm.XffNumTrustedHops = plan.xffNumTrustedHops
+		hcm.UseRemoteAddress = wrapperspb.Bool(true)
+	} else if len(plan.xffTrustedCIDRs) > 0 {
+		hcm.OriginalIpDetectionExtensions = []*corev3.TypedExtensionConfig{{
+			Name: "envoy.http.original_ip_detection.xff",
+			TypedConfig: mustAny(&xffv3.XffConfig{XffTrustedCidrs: &xffv3.XffTrustedCidrs{
+				Cidrs: cidrRanges(plan.xffTrustedCIDRs),
+			}}),
+		}}
 	}
 
 	tlsContext := &tlsv3.DownstreamTlsContext{

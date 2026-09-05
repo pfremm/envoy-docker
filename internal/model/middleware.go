@@ -1,10 +1,14 @@
 package model
 
 import (
+	"encoding/base64"
 	"fmt"
+	"net"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type RedirectSchemeMiddleware struct {
@@ -30,6 +34,60 @@ type CORSMiddleware struct {
 	AllowCredentials                                        bool
 }
 
+// BasicAuthMiddleware configures Envoy's basic_auth filter. Users holds
+// "user:htpasswd-hash" entries. It is security-critical: never log the Users
+// values directly; use RedactedString() for any diagnostic output.
+type BasicAuthMiddleware struct {
+	Users        []string
+	Realm        string
+	HeaderField  string
+	RemoveHeader bool
+}
+
+// ForwardAuthMiddleware configures Envoy's ext_authz filter to forward each
+// request to an external authorization server at Address before it is routed.
+// The server is modeled as an explicit Envoy cluster (see the xDS layer).
+type ForwardAuthMiddleware struct {
+	Address                 string
+	TrustForwardHeader      bool
+	AuthRequestHeaders      []string
+	AuthResponseHeaders     []string
+	AuthResponseHeaderRegex []string
+	TLSInsecure             bool
+	TLSServerName           string
+}
+
+// IPStrategy controls how the client IP is inferred for IP allow/deny lists.
+// By default (Depth==0 and no ExcludedIPs) only the direct downstream address
+// is trusted. Setting Depth trusts that many X-Forwarded-For hops.
+type IPStrategy struct {
+	Depth       uint32
+	ExcludedIPs []string
+}
+
+// IPAllowListMiddleware allows only requests whose source IP matches one of
+// SourceRange (CIDRs). Everything else is rejected (403).
+type IPAllowListMiddleware struct {
+	SourceRange []string
+	Strategy    IPStrategy
+}
+
+// IPDenyListMiddleware rejects requests whose source IP matches one of
+// SourceRange (CIDRs). Everything else is allowed.
+type IPDenyListMiddleware struct {
+	SourceRange []string
+	Strategy    IPStrategy
+}
+
+// RateLimitMiddleware configures Envoy's local_ratelimit token bucket. The
+// bucket is LOCAL to each Envoy proxy instance and route: it is not a shared or
+// distributed limiter.
+type RateLimitMiddleware struct {
+	Average uint32
+	Burst   uint32
+	Period  string
+}
+
 // Middleware is a closed typed union. Exactly one variant must be non-nil.
 type Middleware struct {
 	Name             string
@@ -41,6 +99,11 @@ type Middleware struct {
 	ReplacePathRegex *ReplacePathRegexMiddleware
 	Headers          *HeadersMiddleware
 	CORS             *CORSMiddleware
+	BasicAuth        *BasicAuthMiddleware
+	ForwardAuth      *ForwardAuthMiddleware
+	IPAllowList      *IPAllowListMiddleware
+	IPDenyList       *IPDenyListMiddleware
+	RateLimit        *RateLimitMiddleware
 }
 
 func (m Middleware) Type() string {
@@ -52,6 +115,9 @@ func (m Middleware) Type() string {
 		{"stripprefix", m.StripPrefix != nil}, {"addprefix", m.AddPrefix != nil},
 		{"replacepath", m.ReplacePath != nil}, {"replacepathregex", m.ReplacePathRegex != nil},
 		{"headers", m.Headers != nil}, {"cors", m.CORS != nil},
+		{"basicauth", m.BasicAuth != nil}, {"forwardauth", m.ForwardAuth != nil},
+		{"ipallowlist", m.IPAllowList != nil}, {"ipdenylist", m.IPDenyList != nil},
+		{"ratelimit", m.RateLimit != nil},
 	}
 	found := ""
 	for _, v := range values {
@@ -63,6 +129,28 @@ func (m Middleware) Type() string {
 		}
 	}
 	return found
+}
+
+// RedactedString renders a middleware for logging/diagnostics WITHOUT leaking
+// secrets. Basic auth user:hash entries are replaced with [REDACTED]; no other
+// middleware type carries secret material but is rendered uniformly.
+func (m Middleware) RedactedString() string {
+	switch m.Type() {
+	case "basicauth":
+		return fmt.Sprintf("basicauth(users=[REDACTED], realm=%q, headerfield=%q, removeheader=%v)",
+			m.BasicAuth.Realm, m.BasicAuth.HeaderField, m.BasicAuth.RemoveHeader)
+	case "forwardauth":
+		return fmt.Sprintf("forwardauth(address=%q, trustforwardheader=%v, tls.insecure=%v, tls.servername=%q)",
+			m.ForwardAuth.Address, m.ForwardAuth.TrustForwardHeader, m.ForwardAuth.TLSInsecure, m.ForwardAuth.TLSServerName)
+	case "ipallowlist":
+		return fmt.Sprintf("ipallowlist(sourcerange=%v)", m.IPAllowList.SourceRange)
+	case "ipdenylist":
+		return fmt.Sprintf("ipdenylist(sourcerange=%v)", m.IPDenyList.SourceRange)
+	case "ratelimit":
+		return fmt.Sprintf("ratelimit(average=%d, burst=%d, period=%s)", m.RateLimit.Average, m.RateLimit.Burst, m.RateLimit.Period)
+	default:
+		return m.Type()
+	}
 }
 
 var headerToken = regexp.MustCompile("^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$")
@@ -77,12 +165,51 @@ func validateHeaderName(name string) error {
 	return nil
 }
 
+// parseCIDR parses a CIDR ("10.0.0.0/8") or a bare IP ("10.0.0.5") into a
+// network prefix and prefix length. It is used to validate IP allow/deny lists
+// and to build Envoy CidrRange principals.
+func parseCIDR(value string) (prefix string, prefixLen uint32, err error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", 0, fmt.Errorf("empty CIDR")
+	}
+	if strings.Contains(value, "/") {
+		_, ipNet, perr := net.ParseCIDR(value)
+		if perr != nil {
+			return "", 0, fmt.Errorf("invalid CIDR %q: %w", value, perr)
+		}
+		ones, _ := ipNet.Mask.Size()
+		return ipNet.IP.String(), uint32(ones), nil
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return "", 0, fmt.Errorf("invalid IP address %q", value)
+	}
+	if ip.To4() != nil {
+		return ip.String(), 32, nil
+	}
+	return ip.String(), 128, nil
+}
+
+func validateIPList(name string, list []string) error {
+	if len(list) == 0 {
+		return fmt.Errorf("%s cannot be empty", name)
+	}
+	for _, c := range list {
+		if _, _, err := parseCIDR(c); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
 func ValidateMiddlewareChain(chain []Middleware) error {
 	redirects := 0
 	pathOps := 0
 	hasRegexPath := false
 	redirectSeen := false
 	corsSeen := false
+	securityFilters := map[string]string{}
 	for _, m := range chain {
 		if err := m.Validate(); err != nil {
 			return err
@@ -106,6 +233,23 @@ func ValidateMiddlewareChain(chain []Middleware) error {
 		}
 		if m.CORS != nil {
 			corsSeen = true
+		}
+		filter := ""
+		switch {
+		case m.BasicAuth != nil:
+			filter = "basic_auth"
+		case m.ForwardAuth != nil:
+			filter = "ext_authz"
+		case m.IPAllowList != nil || m.IPDenyList != nil:
+			filter = "rbac"
+		case m.RateLimit != nil:
+			filter = "local_ratelimit"
+		}
+		if filter != "" {
+			if prior := securityFilters[filter]; prior != "" {
+				return fmt.Errorf("middleware %q and %q both configure Envoy filter %s; same-filter security middleware cannot be composed without silent overwrite", prior, m.Name, filter)
+			}
+			securityFilters[filter] = m.Name
 		}
 	}
 	if redirects > 1 {
@@ -198,6 +342,152 @@ func (m Middleware) Validate() error {
 			}
 			_ = age
 		}
+	case "basicauth":
+		if len(m.BasicAuth.Users) == 0 {
+			return fmt.Errorf("middleware %q basicauth.users cannot be empty", m.Name)
+		}
+		for _, u := range m.BasicAuth.Users {
+			if strings.ContainsAny(u, "\r\n") {
+				return fmt.Errorf("middleware %q basicauth.users entries cannot contain CR or LF", m.Name)
+			}
+			user, hash, ok := strings.Cut(u, ":")
+			if !ok {
+				// Do not echo the raw entry: it may contain a hash.
+				return fmt.Errorf("middleware %q basicauth.users entries must be user:htpasswd-hash", m.Name)
+			}
+			if strings.TrimSpace(user) == "" {
+				return fmt.Errorf("middleware %q basicauth.users has an entry with an empty username", m.Name)
+			}
+			if hash == "" {
+				return fmt.Errorf("middleware %q basicauth.users has an entry with an empty hash", m.Name)
+			}
+			if !strings.HasPrefix(hash, "{SHA}") {
+				return fmt.Errorf("middleware %q basicauth.users contains an htpasswd hash unsupported by this Envoy build; use {SHA}", m.Name)
+			}
+			decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(hash, "{SHA}"))
+			if err != nil || len(decoded) != 20 {
+				return fmt.Errorf("middleware %q basicauth.users contains an invalid {SHA} htpasswd hash", m.Name)
+			}
+		}
+		if m.BasicAuth.HeaderField != "" {
+			if err := validateHeaderName(m.BasicAuth.HeaderField); err != nil {
+				return fmt.Errorf("middleware %q basicauth.headerfield: %w", m.Name, err)
+			}
+		}
+		if strings.ContainsAny(m.BasicAuth.Realm, "\r\n") {
+			return fmt.Errorf("middleware %q basicauth.realm cannot contain CR or LF", m.Name)
+		}
+	case "forwardauth":
+		if strings.TrimSpace(m.ForwardAuth.Address) == "" {
+			return fmt.Errorf("middleware %q forwardauth.address is required", m.Name)
+		}
+		address := m.ForwardAuth.Address
+		if strings.Contains(address, "://") {
+			u, err := url.ParseRequestURI(address)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil {
+				return fmt.Errorf("middleware %q forwardauth.address must be an http(s) URL or host[:port]", m.Name)
+			}
+			if u.RawQuery != "" || u.Fragment != "" {
+				return fmt.Errorf("middleware %q forwardauth.address query strings and fragments are not supported by Envoy ext_authz", m.Name)
+			}
+			address = u.Host
+		}
+		host, portStr, perr := net.SplitHostPort(address)
+		if perr != nil {
+			// Allow a bare host (no port); a bare IP or hostname is fine.
+			if net.ParseIP(address) == nil && !isLikelyHostname(address) {
+				return fmt.Errorf("middleware %q forwardauth.address %q is not a valid host:port", m.Name, m.ForwardAuth.Address)
+			}
+			host = address
+			portStr = ""
+		}
+		if host == "" {
+			return fmt.Errorf("middleware %q forwardauth.address has an empty host", m.Name)
+		}
+		if portStr != "" {
+			p, uerr := strconv.ParseUint(portStr, 10, 16)
+			if uerr != nil || p == 0 || p > 65535 {
+				return fmt.Errorf("middleware %q forwardauth.address has an invalid port", m.Name)
+			}
+		}
+		if m.ForwardAuth.TLSInsecure && m.ForwardAuth.TLSServerName == "" {
+			// insecure without SNI is allowed (e.g. IP endpoints); nothing to reject.
+		}
+		for _, header := range append(append([]string(nil), m.ForwardAuth.AuthRequestHeaders...), m.ForwardAuth.AuthResponseHeaders...) {
+			if err := validateHeaderName(header); err != nil {
+				return fmt.Errorf("middleware %q forwardauth header: %w", m.Name, err)
+			}
+		}
+		for _, pattern := range m.ForwardAuth.AuthResponseHeaderRegex {
+			if _, err := regexp.Compile(pattern); err != nil {
+				return fmt.Errorf("middleware %q forwardauth.authresponseheaderregex %q: %w", m.Name, pattern, err)
+			}
+		}
+	case "ipallowlist":
+		if err := validateIPList(fmt.Sprintf("middleware %q ipallowlist.sourcerange", m.Name), m.IPAllowList.SourceRange); err != nil {
+			return err
+		}
+		if err := validateIPStrategy(m.Name, "ipallowlist", m.IPAllowList.Strategy); err != nil {
+			return err
+		}
+	case "ipdenylist":
+		if err := validateIPList(fmt.Sprintf("middleware %q ipdenylist.sourcerange", m.Name), m.IPDenyList.SourceRange); err != nil {
+			return err
+		}
+		if err := validateIPStrategy(m.Name, "ipdenylist", m.IPDenyList.Strategy); err != nil {
+			return err
+		}
+	case "ratelimit":
+		if m.RateLimit.Average == 0 {
+			return fmt.Errorf("middleware %q ratelimit.average must be > 0", m.Name)
+		}
+		if m.RateLimit.Burst == 0 {
+			return fmt.Errorf("middleware %q ratelimit.burst must be > 0", m.Name)
+		}
+		if m.RateLimit.Period == "" {
+			return fmt.Errorf("middleware %q ratelimit.period is required", m.Name)
+		}
+		period, err := time.ParseDuration(m.RateLimit.Period)
+		if err != nil {
+			return fmt.Errorf("middleware %q ratelimit.period %q is not a valid duration", m.Name, m.RateLimit.Period)
+		}
+		if period < 50*time.Millisecond {
+			return fmt.Errorf("middleware %q ratelimit.period must be at least 50ms for Envoy local_ratelimit", m.Name)
+		}
 	}
 	return nil
+}
+
+func validateIPStrategy(mwName, field string, s IPStrategy) error {
+	if s.Depth > 0 && len(s.ExcludedIPs) > 0 {
+		return fmt.Errorf("middleware %q %s.ipstrategy.depth and excludedips are mutually exclusive", mwName, field)
+	}
+	if len(s.ExcludedIPs) > 0 {
+		for _, c := range s.ExcludedIPs {
+			if _, _, err := parseCIDR(c); err != nil {
+				return fmt.Errorf("middleware %q %s.ipstrategy.excludedips: %w", mwName, field, err)
+			}
+		}
+	}
+	return nil
+}
+
+// isLikelyHostname reports whether s looks like a DNS hostname (labels of
+// letters/digits/hyphens, dot-separated). Used to accept a bare host in a
+// forwardauth.address that has no explicit port.
+func isLikelyHostname(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }

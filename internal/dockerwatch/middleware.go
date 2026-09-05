@@ -297,8 +297,107 @@ func buildMiddleware(d middlewareDraft) (model.Middleware, error) {
 			return m, err
 		}
 		m.CORS = c
+	case "basicauth":
+		if err := onlyFields(d, "users", "realm", "headerfield", "removeheader"); err != nil {
+			return m, err
+		}
+		users, err := listField(d, "users")
+		if err != nil {
+			return m, err
+		}
+		removeHeader, err := boolField(d, "removeheader")
+		if err != nil {
+			return m, err
+		}
+		m.BasicAuth = &model.BasicAuthMiddleware{
+			Users:        users,
+			Realm:        scalar("realm"),
+			HeaderField:  scalar("headerfield"),
+			RemoveHeader: removeHeader,
+		}
+	case "forwardauth":
+		if err := onlyFields(d, "address", "trustforwardheader", "authrequestheaders",
+			"authresponseheaders", "authresponseheaderregex", "tls.insecure", "tls.servername"); err != nil {
+			return m, err
+		}
+		fa := &model.ForwardAuthMiddleware{
+			Address:       scalar("address"),
+			TLSInsecure:   false,
+			TLSServerName: scalar("tls.servername"),
+		}
+		var err error
+		if fa.TrustForwardHeader, err = boolField(d, "trustforwardheader"); err != nil {
+			return m, err
+		}
+		if fa.TLSInsecure, err = boolField(d, "tls.insecure"); err != nil {
+			return m, err
+		}
+		if fa.AuthRequestHeaders, err = listField(d, "authrequestheaders"); err != nil {
+			return m, err
+		}
+		if fa.AuthResponseHeaders, err = listField(d, "authresponseheaders"); err != nil {
+			return m, err
+		}
+		if fa.AuthResponseHeaderRegex, err = listField(d, "authresponseheaderregex"); err != nil {
+			return m, err
+		}
+		m.ForwardAuth = fa
+	case "ipallowlist":
+		if err := onlyFields(d, "sourcerange", "ipstrategy.depth", "ipstrategy.excludedips"); err != nil {
+			return m, err
+		}
+		allow := &model.IPAllowListMiddleware{}
+		var err error
+		if allow.SourceRange, err = listField(d, "sourcerange"); err != nil {
+			return m, err
+		}
+		if allow.Strategy.Depth, err = parseUint32Field(d, "ipstrategy.depth"); err != nil {
+			return m, err
+		}
+		if allow.Strategy.ExcludedIPs, err = listField(d, "ipstrategy.excludedips"); err != nil {
+			return m, err
+		}
+		m.IPAllowList = allow
+	case "ipdenylist":
+		if err := onlyFields(d, "sourcerange", "ipstrategy.depth", "ipstrategy.excludedips"); err != nil {
+			return m, err
+		}
+		deny := &model.IPDenyListMiddleware{}
+		var err error
+		if deny.SourceRange, err = listField(d, "sourcerange"); err != nil {
+			return m, err
+		}
+		if deny.Strategy.Depth, err = parseUint32Field(d, "ipstrategy.depth"); err != nil {
+			return m, err
+		}
+		if deny.Strategy.ExcludedIPs, err = listField(d, "ipstrategy.excludedips"); err != nil {
+			return m, err
+		}
+		m.IPDenyList = deny
+	case "ratelimit":
+		if err := onlyFields(d, "average", "burst", "period"); err != nil {
+			return m, err
+		}
+		rl := &model.RateLimitMiddleware{Period: scalar("period")}
+		var err error
+		if rl.Average, err = parseUint32Field(d, "average"); err != nil {
+			return m, err
+		}
+		if rl.Burst, err = parseUint32Field(d, "burst"); err != nil {
+			return m, err
+		}
+		m.RateLimit = rl
 	default:
 		return m, fmt.Errorf("middleware %q has unknown type %q", d.name, d.typ)
 	}
 	return m, nil
+}
+
+// parseUint32Field reads an optional non-negative integer field.
+func parseUint32Field(d middlewareDraft, name string) (uint32, error) {
+	v, ok := d.fields[name]
+	if !ok {
+		return 0, nil
+	}
+	return parseUint32Label(middlewarePrefix+d.name+"."+d.typ+"."+name, v, true)
 }
