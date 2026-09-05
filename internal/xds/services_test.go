@@ -101,6 +101,31 @@ func TestBuildSnapshotForConfigEmitsExplicitZeroMaxEjectionPercent(t *testing.T)
 	}
 }
 
+func TestBuildSnapshotForConfigLegacyRouteUnchanged(t *testing.T) {
+	// A legacy router (no .service) must keep its implicit per-router
+	// cluster and endpoint through the config-based builder.
+	cfg := model.HTTPConfiguration{Routes: map[string]model.Route{"app": {
+		Subdomain: "app", RouterName: "web", Source: model.SourceDocker,
+		Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}},
+	}}, Services: map[string]model.HTTPService{}}
+	snap, err := BuildSnapshotForConfig("1", cfg, Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := snap.GetResources(resourcev3.ClusterType)["app"]; !ok {
+		t.Fatalf("legacy cluster missing: %v", snap.GetResources(resourcev3.ClusterType))
+	}
+	cla := snap.GetResources(resourcev3.EndpointType)["app"].(*endpointv3.ClusterLoadAssignment)
+	if len(cla.Endpoints[0].LbEndpoints) != 1 {
+		t.Fatalf("endpoints=%+v", cla)
+	}
+	rc := snap.GetResources(resourcev3.RouteType)[httpsRouteConfigName].(*routev3.RouteConfiguration)
+	a := rc.VirtualHosts[0].Routes[0].GetRoute()
+	if a.GetCluster() != "app" || a.Timeout != nil || a.RetryPolicy != nil || len(a.HashPolicy) != 0 {
+		t.Fatalf("legacy action must stay plain: %+v", a)
+	}
+}
+
 func TestBuildSnapshotForConfigRejectsUnknownAndCycle(t *testing.T) {
 	base := Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443}
 	_, err := BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{"app": {Subdomain: "app", ServiceName: "missing"}}, Services: map[string]model.HTTPService{}}, base)
