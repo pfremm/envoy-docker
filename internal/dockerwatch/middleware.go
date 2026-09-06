@@ -387,6 +387,98 @@ func buildMiddleware(d middlewareDraft) (model.Middleware, error) {
 			return m, err
 		}
 		m.RateLimit = rl
+	case "compress":
+		if err := onlyFields(d, "minresponsebytes", "contenttypes", "excludedcontenttypes", "disableonetagheader"); err != nil {
+			return m, err
+		}
+		c := &model.CompressMiddleware{}
+		var err error
+		if c.MinResponseBytes, err = parseUint32Field(d, "minresponsebytes"); err != nil {
+			return m, err
+		}
+		if c.ContentTypes, err = listField(d, "contenttypes"); err != nil {
+			return m, err
+		}
+		if c.ExcludedContentTypes, err = listField(d, "excludedcontenttypes"); err != nil {
+			return m, err
+		}
+		if c.DisableOnETagHeader, err = boolField(d, "disableonetagheader"); err != nil {
+			return m, err
+		}
+		m.Compress = c
+	case "retry":
+		if err := onlyFields(d, "attempts", "pertrytimeout", "retryon"); err != nil {
+			return m, err
+		}
+		r := &model.RetryMiddleware{
+			PerTryTimeout: scalar("pertrytimeout"),
+			RetryOn:       scalar("retryon"),
+		}
+		var err error
+		if r.Attempts, err = parseUint32Field(d, "attempts"); err != nil {
+			return m, err
+		}
+		m.Retry = r
+	case "circuitbreaker":
+		if err := onlyFields(d, "maxconnections", "maxpendingrequests", "maxrequests", "maxretries"); err != nil {
+			return m, err
+		}
+		cb := &model.CircuitBreakerMiddleware{}
+		var err error
+		if cb.MaxConnections, err = parseUint32Field(d, "maxconnections"); err != nil {
+			return m, err
+		}
+		if cb.MaxPendingRequests, err = parseUint32Field(d, "maxpendingrequests"); err != nil {
+			return m, err
+		}
+		if cb.MaxRequests, err = parseUint32Field(d, "maxrequests"); err != nil {
+			return m, err
+		}
+		if cb.MaxRetries, err = parseUint32Field(d, "maxretries"); err != nil {
+			return m, err
+		}
+		m.CircuitBreaker = cb
+	case "buffering":
+		if err := onlyFields(d, "maxrequestbytes", "maxresponsebytes", "memrequestbytes", "memresponsebytes", "retryexpression"); err != nil {
+			return m, err
+		}
+		b := &model.BufferingMiddleware{RetryExpression: scalar("retryexpression")}
+		var err error
+		if b.MaxRequestBytes, err = parseUint32Field(d, "maxrequestbytes"); err != nil {
+			return m, err
+		}
+		if b.MaxResponseBytes, err = parseUint32Field(d, "maxresponsebytes"); err != nil {
+			return m, err
+		}
+		if b.MemRequestBytes, err = parseUint32Field(d, "memrequestbytes"); err != nil {
+			return m, err
+		}
+		if b.MemResponseBytes, err = parseUint32Field(d, "memresponsebytes"); err != nil {
+			return m, err
+		}
+		m.Buffering = b
+	case "errors":
+		if err := onlyFields(d, "status", "service", "query"); err != nil {
+			return m, err
+		}
+		e := &model.ErrorsMiddleware{
+			Service: scalar("service"),
+			Query:   scalar("query"),
+		}
+		var err error
+		if e.Status, err = listField(d, "status"); err != nil {
+			return m, err
+		}
+		m.Errors = e
+	case "grpcweb":
+		if err := onlyFields(d, "enabled"); err != nil {
+			return m, err
+		}
+		enabled, err := boolField(d, "enabled")
+		if err != nil {
+			return m, err
+		}
+		m.GRPCWeb = &model.GRPCWebMiddleware{Enabled: enabled}
 	default:
 		return m, fmt.Errorf("middleware %q has unknown type %q", d.name, d.typ)
 	}

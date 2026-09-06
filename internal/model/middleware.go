@@ -88,6 +88,64 @@ type RateLimitMiddleware struct {
 	Period  string
 }
 
+// CompressMiddleware configures Envoy's compressor filter. ContentTypes and
+// ExcludedContentTypes are MIME prefixes. DisableOnETagHeader prevents
+// compression when a weak or strong ETag exists. Gzip is always enabled; brotli
+// is enabled only if the linked Envoy build supports it (verified at build time).
+type CompressMiddleware struct {
+	MinResponseBytes      uint32
+	ContentTypes          []string
+	ExcludedContentTypes  []string
+	DisableOnETagHeader   bool
+}
+
+// RetryMiddleware configures Envoy's per-route retry policy. Attempts is the
+// maximum number of tries (including the original request). PerTryTimeout is the
+// timeout for each individual attempt. RetryOn is an Envoy retry condition string.
+type RetryMiddleware struct {
+	Attempts        uint32
+	PerTryTimeout   string
+	RetryOn         string
+}
+
+// CircuitBreakerMiddleware configures Envoy cluster-scoped circuit breaker
+// thresholds. Because breakers are cluster-scoped, the xDS layer derives
+// deterministic cluster variants when policies differ and deduplicates identical ones.
+type CircuitBreakerMiddleware struct {
+	MaxConnections      uint32
+	MaxPendingRequests  uint32
+	MaxRequests         uint32
+	MaxRetries          uint32
+}
+
+// BufferingMiddleware configures Envoy's buffer filter. MaxRequestBytes and
+// MaxResponseBytes set the maximum body sizes. MemRequestBytes and MemResponseBytes
+// set in-memory buffer limits before spilling to disk. RetryExpression is unsupported
+// and rejected.
+type BufferingMiddleware struct {
+	MaxRequestBytes   uint32
+	MaxResponseBytes  uint32
+	MemRequestBytes   uint32
+	MemResponseBytes  uint32
+	RetryExpression   string
+}
+
+// ErrorsMiddleware configures custom error-page handling. Status is a comma-separated
+// list of HTTP status codes or ranges (e.g. "404,500-599"). Service must resolve
+// through named HTTP services. Query is the path/query to forward to the error service.
+// Error handling must not recurse.
+type ErrorsMiddleware struct {
+	Status  []string
+	Service string
+	Query   string
+}
+
+// GRPCWebMiddleware enables Envoy's grpc_web filter. When enabled, CORS, compression,
+// and filter ordering must be valid, and upstream protocol validation is enforced.
+type GRPCWebMiddleware struct {
+	Enabled bool
+}
+
 // Middleware is a closed typed union. Exactly one variant must be non-nil.
 type Middleware struct {
 	Name             string
@@ -104,6 +162,12 @@ type Middleware struct {
 	IPAllowList      *IPAllowListMiddleware
 	IPDenyList       *IPDenyListMiddleware
 	RateLimit        *RateLimitMiddleware
+	Compress         *CompressMiddleware
+	Retry            *RetryMiddleware
+	CircuitBreaker   *CircuitBreakerMiddleware
+	Buffering        *BufferingMiddleware
+	Errors           *ErrorsMiddleware
+	GRPCWeb          *GRPCWebMiddleware
 }
 
 func (m Middleware) Type() string {
@@ -118,6 +182,9 @@ func (m Middleware) Type() string {
 		{"basicauth", m.BasicAuth != nil}, {"forwardauth", m.ForwardAuth != nil},
 		{"ipallowlist", m.IPAllowList != nil}, {"ipdenylist", m.IPDenyList != nil},
 		{"ratelimit", m.RateLimit != nil},
+		{"compress", m.Compress != nil}, {"retry", m.Retry != nil},
+		{"circuitbreaker", m.CircuitBreaker != nil}, {"buffering", m.Buffering != nil},
+		{"errors", m.Errors != nil}, {"grpcweb", m.GRPCWeb != nil},
 	}
 	found := ""
 	for _, v := range values {
@@ -453,6 +520,76 @@ func (m Middleware) Validate() error {
 		}
 		if period < 50*time.Millisecond {
 			return fmt.Errorf("middleware %q ratelimit.period must be at least 50ms for Envoy local_ratelimit", m.Name)
+		}
+	case "compress":
+		// MinResponseBytes defaults to 30 if zero; no validation error
+		for _, ct := range m.Compress.ContentTypes {
+			if strings.TrimSpace(ct) == "" {
+				return fmt.Errorf("middleware %q compress.contenttypes cannot contain empty values", m.Name)
+			}
+		}
+		for _, ct := range m.Compress.ExcludedContentTypes {
+			if strings.TrimSpace(ct) == "" {
+				return fmt.Errorf("middleware %q compress.excludedcontenttypes cannot contain empty values", m.Name)
+			}
+		}
+	case "retry":
+		if m.Retry.Attempts == 0 {
+			return fmt.Errorf("middleware %q retry.attempts must be > 0", m.Name)
+		}
+		if m.Retry.PerTryTimeout == "" {
+			return fmt.Errorf("middleware %q retry.pertrytimeout is required", m.Name)
+		}
+		if _, err := time.ParseDuration(m.Retry.PerTryTimeout); err != nil {
+			return fmt.Errorf("middleware %q retry.pertrytimeout %q is not a valid duration", m.Name, m.Retry.PerTryTimeout)
+		}
+		if m.Retry.RetryOn == "" {
+			return fmt.Errorf("middleware %q retry.retryon is required", m.Name)
+		}
+	case "circuitbreaker":
+		if m.CircuitBreaker.MaxConnections == 0 && m.CircuitBreaker.MaxPendingRequests == 0 &&
+			m.CircuitBreaker.MaxRequests == 0 && m.CircuitBreaker.MaxRetries == 0 {
+			return fmt.Errorf("middleware %q circuitbreaker must configure at least one threshold", m.Name)
+		}
+	case "buffering":
+		if m.Buffering.RetryExpression != "" {
+			return fmt.Errorf("middleware %q buffering.retryexpression is not supported by this Envoy build", m.Name)
+		}
+		if m.Buffering.MaxRequestBytes == 0 && m.Buffering.MaxResponseBytes == 0 {
+			return fmt.Errorf("middleware %q buffering must configure at least one max size", m.Name)
+		}
+	case "errors":
+		if len(m.Errors.Status) == 0 {
+			return fmt.Errorf("middleware %q errors.status cannot be empty", m.Name)
+		}
+		for _, s := range m.Errors.Status {
+			// Accept "404" or "500-599"
+			if strings.Contains(s, "-") {
+				parts := strings.Split(s, "-")
+				if len(parts) != 2 {
+					return fmt.Errorf("middleware %q errors.status range %q must be start-end", m.Name, s)
+				}
+				start, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+				end, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+				if err1 != nil || err2 != nil || start < 100 || end > 599 || start > end {
+					return fmt.Errorf("middleware %q errors.status range %q is invalid", m.Name, s)
+				}
+			} else {
+				code, err := strconv.Atoi(strings.TrimSpace(s))
+				if err != nil || code < 100 || code > 599 {
+					return fmt.Errorf("middleware %q errors.status code %q is invalid", m.Name, s)
+				}
+			}
+		}
+		if strings.TrimSpace(m.Errors.Service) == "" {
+			return fmt.Errorf("middleware %q errors.service is required", m.Name)
+		}
+		if m.Errors.Query != "" && !strings.HasPrefix(m.Errors.Query, "/") {
+			return fmt.Errorf("middleware %q errors.query must start with /", m.Name)
+		}
+	case "grpcweb":
+		if !m.GRPCWeb.Enabled {
+			return fmt.Errorf("middleware %q grpcweb.enabled must be true (or omit the middleware)", m.Name)
 		}
 	}
 	return nil

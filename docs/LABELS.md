@@ -173,6 +173,35 @@ standard middleware stack. Unsupported orderings reject only that router.
 | `ipallowlist` | `sourcerange` (required CIDR/IP list), `ipstrategy.depth`, `ipstrategy.excludedips` |
 | `ipdenylist` | `sourcerange` (required CIDR/IP list), `ipstrategy.depth`, `ipstrategy.excludedips` |
 | `ratelimit` | `average`, `burst`, `period` (all required; `period` must be at least `50ms`) |
+| `compress` | `minresponsebytes`, `contenttypes` (list), `excludedcontenttypes` (list), `disableonetagheader` |
+| `retry` | `attempts` (required positive integer), `pertrytimeout` (required duration), `retryon` (required Envoy retry conditions) |
+| `circuitbreaker` | `maxconnections`, `maxpendingrequests`, `maxrequests`, `maxretries` (at least one required) |
+| `buffering` | `maxrequestbytes`, `maxresponsebytes` (at least one required); `retryexpression` is not supported |
+| `errors` | `status` (required list of codes/ranges like `404,500-599`), `service` (required), `query` (path, optional) |
+| `grpcweb` | `enabled` (must be `true`; omit the middleware if you don't want gRPC-Web) |
+
+#### Resilience and protocol middleware limitations
+
+**Compression and gRPC-Web** are listener-level filters in Envoy v1.37 and
+currently parse but do not yet emit xDS configuration. A future build will
+add listener-level installation when at least one route references them.
+
+**Circuit breakers** are cluster-scoped in Envoy. The xDS layer will derive
+deterministic cluster variants when policies differ across routes and
+deduplicate identical policies. This is not yet implemented; the middleware
+is accepted but circuit-breaking logic is pending.
+
+**Error pages** require internal redirect to a named error service. The
+middleware is accepted and validated, but redirect installation is pending.
+
+**Retry** policies are per-route and fully implemented via
+`RouteAction.RetryPolicy`. Middleware retry overrides router-level retry
+defaults when present.
+
+**Buffering** is per-route and implemented for `maxrequestbytes` only; Envoy's
+buffer filter does not expose `maxresponsebytes`, `memrequestbytes`,
+`memresponsebytes`, or retry-expression at the per-route level. Unsupported
+settings are rejected at model validation rather than silently ignored.
 
 Regexes are validated when labels are parsed. Invalid expressions never reach
 xDS. Replacements accept Go/Traefik capture references (`$1` or `${1}`), which
