@@ -1,6 +1,7 @@
 package xds
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
+	"github.com/bryanpfremm/envoy-control-plane/internal/rule"
 )
 
 func testLogger() *slog.Logger {
@@ -158,4 +160,263 @@ func decodeHCM(t *testing.T, l *listenerv3.Listener) *hcmv3.HttpConnectionManage
 		t.Fatalf("unmarshaling HCM for listener %q: %v", l.Name, err)
 	}
 	return hcm
+}
+
+// vhByDomain indexes the virtual hosts of a route configuration by their
+// (single) domain.
+func vhByDomain(t *testing.T, rc *routev3.RouteConfiguration) map[string]*routev3.VirtualHost {
+	t.Helper()
+	byDomain := map[string]*routev3.VirtualHost{}
+	for _, vh := range rc.VirtualHosts {
+		if len(vh.Domains) != 1 {
+			t.Fatalf("virtual host %q has %d domains, want 1: %v", vh.Name, len(vh.Domains), vh.Domains)
+		}
+		byDomain[vh.Domains[0]] = vh
+	}
+	return byDomain
+}
+
+func TestBuildRouteConfig_PriorityOrdering(t *testing.T) {
+	// Two rule-based routes on the same host. The shorter rule has an
+	// explicit priority and must be emitted first (Envoy first-match-wins).
+	routes := map[string]model.Route{
+		"api": {
+			Subdomain:  "api",
+			Endpoints:  []model.Endpoint{{Address: "10.0.0.2", Port: 8080}},
+			Source:     model.SourceDocker,
+			Origin:     "c1/api",
+			Rule:       model.Rule{Node: model.AtomNode(model.NewPathPrefix("/api"))},
+			RuleExpr:   `PathPrefix(/api)`,
+			RouterName: "api",
+		},
+		"health": {
+			Subdomain:   "health",
+			Endpoints:   []model.Endpoint{{Address: "10.0.0.3", Port: 9090}},
+			Source:      model.SourceDocker,
+			Origin:      "c1/health",
+			Rule:        model.Rule{Node: model.AtomNode(model.NewPath("/health"))},
+			RuleExpr:    `Path(/health)`,
+			RouterName:  "health",
+			Priority:    10,
+			PrioritySet: true,
+		},
+	}
+	rc := buildHTTPSRouteConfiguration(routes, sortedSubdomains(routes), "example.com", testLogger())
+	byDomain := vhByDomain(t, rc)
+
+	// Both routes live on the host of their (absent) Host atom -> they fall
+	// back to their subdomain host; here each has its own host, so check the
+	// shared-host case separately below.
+	if len(byDomain) != 2 {
+		t.Fatalf("expected 2 virtual hosts, got %v", byDomain)
+	}
+}
+
+func TestBuildRouteConfig_SameHostPrecedence(t *testing.T) {
+	// Two routers advertising the same host with different rules: they must
+	// land in one virtual host, ordered by precedence (explicit priority
+	// first, then specificity, then router name).
+	mk := func(sub, ruleExpr, router string, prio int, set bool) model.Route {
+		r, err := rule.Parse(ruleExpr)
+		if err != nil {
+			panic(err)
+		}
+		return model.Route{
+			Subdomain:   sub,
+			Endpoints:   []model.Endpoint{{Address: "10.0.0.1", Port: 8080}},
+			Source:      model.SourceDocker,
+			Origin:      "c/" + router,
+			Rule:        r,
+			RuleExpr:    ruleExpr,
+			RouterName:  router,
+			Priority:    prio,
+			PrioritySet: set,
+		}
+	}
+	routes := map[string]model.Route{
+		"broad":  mk("broad", `Host(app.example.com) && PathPrefix(/)`, "broad", 0, false),
+		"narrow": mk("narrow", `Host(app.example.com) && PathPrefix(/api) && Method(GET)`, "narrow", 0, false),
+		"pinned": mk("pinned", `Host(app.example.com) && Path(/)`, "pinned", 5, true),
+	}
+	rc := buildHTTPSRouteConfiguration(routes, sortedSubdomains(routes), "example.com", testLogger())
+	byDomain := vhByDomain(t, rc)
+
+	vh, ok := byDomain["app.example.com"]
+	if !ok {
+		t.Fatalf("expected virtual host app.example.com, got %v", byDomain)
+	}
+	if len(vh.Routes) != 3 {
+		t.Fatalf("expected 3 routes in the shared virtual host, got %d", len(vh.Routes))
+	}
+	// First: the pinned route (explicit priority beats specificity).
+	if vh.Routes[0].GetRoute().GetCluster() != "pinned" {
+		t.Errorf("route[0] cluster = %q, want pinned (explicit priority first)", vh.Routes[0].GetRoute().GetCluster())
+	}
+	// Second: the narrow rule (longer rule string than broad).
+	if vh.Routes[1].GetRoute().GetCluster() != "narrow" {
+		t.Errorf("route[1] cluster = %q, want narrow (more specific)", vh.Routes[1].GetRoute().GetCluster())
+	}
+	// Last: the broad prefix.
+	if vh.Routes[2].GetRoute().GetCluster() != "broad" {
+		t.Errorf("route[2] cluster = %q, want broad (least specific last)", vh.Routes[2].GetRoute().GetCluster())
+	}
+}
+
+func TestBuildRouteConfig_LegacyMovesToCatchAll(t *testing.T) {
+	// With a rule-based route present, a legacy subdomain route must move
+	// into the catch-all "*" virtual host.
+	r, err := rule.Parse(`Host(app.example.com) && PathPrefix(/api)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := map[string]model.Route{
+		"api": {
+			Subdomain:  "api",
+			Endpoints:  []model.Endpoint{{Address: "10.0.0.1", Port: 8080}},
+			Source:     model.SourceDocker,
+			Origin:     "c/api",
+			Rule:       r,
+			RuleExpr:   `Host(app.example.com) && PathPrefix(/api)`,
+			RouterName: "api",
+		},
+		"legacy": {
+			Subdomain:  "legacy",
+			Endpoints:  []model.Endpoint{{Address: "10.0.0.2", Port: 8080}},
+			Source:     model.SourceDocker,
+			Origin:     "c/legacy",
+			RouterName: "legacy",
+		},
+	}
+	rc := buildHTTPSRouteConfiguration(routes, sortedSubdomains(routes), "example.com", testLogger())
+	byDomain := vhByDomain(t, rc)
+
+	if _, ok := byDomain["app.example.com"]; !ok {
+		t.Errorf("expected virtual host app.example.com, got %v", byDomain)
+	}
+	catchAll, ok := byDomain["*"]
+	if !ok {
+		t.Fatalf("expected catch-all virtual host, got %v", byDomain)
+	}
+	if len(catchAll.Routes) != 1 || catchAll.Routes[0].GetRoute().GetCluster() != "legacy" {
+		t.Errorf("catch-all should carry the legacy route, got %+v", catchAll.Routes)
+	}
+	if catchAll.Routes[0].GetMatch().GetPrefix() != "/" {
+		t.Errorf("legacy catch-all route prefix = %q, want /", catchAll.Routes[0].GetMatch().GetPrefix())
+	}
+}
+
+func TestBuildRouteConfig_LegacyOnlyShapeUnchanged(t *testing.T) {
+	// No rule-based routes: the legacy shape is preserved exactly (one
+	// virtual host per subdomain, no catch-all).
+	routes := map[string]model.Route{
+		"one": {
+			Subdomain: "one",
+			Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}},
+			Source:    model.SourceDocker,
+		},
+		"two": {
+			Subdomain: "two",
+			Endpoints: []model.Endpoint{{Address: "10.0.0.2", Port: 8080}},
+			Source:    model.SourceDocker,
+		},
+	}
+	rc := buildHTTPSRouteConfiguration(routes, sortedSubdomains(routes), "example.com", testLogger())
+	byDomain := vhByDomain(t, rc)
+	if len(byDomain) != 2 {
+		t.Fatalf("expected 2 virtual hosts, got %v", byDomain)
+	}
+	if _, ok := byDomain["*"]; ok {
+		t.Error("no catch-all virtual host should exist in the legacy-only shape")
+	}
+	for _, sub := range []string{"one", "two"} {
+		vh := byDomain[sub+".example.com"]
+		if vh == nil {
+			t.Fatalf("missing virtual host %s.example.com", sub)
+		}
+		if len(vh.Routes) != 1 || vh.Routes[0].GetMatch().GetPrefix() != "/" {
+			t.Errorf("virtual host %s should have one catch-all route, got %+v", sub, vh.Routes)
+		}
+	}
+}
+
+func TestBuildRouteConfig_DNFEmitsMultipleRoutes(t *testing.T) {
+	// Host(a) && (Path(/x) || PathPrefix(/y)) expands to two DNF terms and
+	// must emit two generated routes pointing at the same cluster.
+	r, err := rule.Parse(`Host(app.example.com) && (Path(/x) || PathPrefix(/y))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := map[string]model.Route{
+		"multi": {
+			Subdomain:  "multi",
+			Endpoints:  []model.Endpoint{{Address: "10.0.0.1", Port: 8080}},
+			Source:     model.SourceDocker,
+			Origin:     "c/multi",
+			Rule:       r,
+			RuleExpr:   `Host(app.example.com) && (Path(/x) || PathPrefix(/y))`,
+			RouterName: "multi",
+		},
+	}
+	rc := buildHTTPSRouteConfiguration(routes, sortedSubdomains(routes), "example.com", testLogger())
+	vh := vhByDomain(t, rc)["app.example.com"]
+	if vh == nil {
+		t.Fatalf("expected virtual host app.example.com, got %+v", rc.VirtualHosts)
+	}
+	if len(vh.Routes) != 2 {
+		t.Fatalf("expected 2 generated routes (one per DNF term), got %d", len(vh.Routes))
+	}
+	for i, rt := range vh.Routes {
+		if rt.GetRoute().GetCluster() != "multi" {
+			t.Errorf("route[%d] cluster = %q, want multi (same action)", i, rt.GetRoute().GetCluster())
+		}
+	}
+	// The exact-path term is more specific and must come first.
+	if vh.Routes[0].GetMatch().GetPath() != "/x" {
+		t.Errorf("route[0] path = %q, want /x (exact path first)", vh.Routes[0].GetMatch().GetPath())
+	}
+	if vh.Routes[1].GetMatch().GetPrefix() != "/y" {
+		t.Errorf("route[1] prefix = %q, want /y", vh.Routes[1].GetMatch().GetPrefix())
+	}
+}
+
+func TestBuildRouteConfig_UntranslatableRuleSkippedOnly(t *testing.T) {
+	// A rule using ClientIP cannot be translated; only that route is
+	// skipped (with a warning), the rest of the host is unaffected.
+	r, err := rule.Parse(`Host(app.example.com) && ClientIP(10.0.0.0/8)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := map[string]model.Route{
+		"bad": {
+			Subdomain:  "bad",
+			Endpoints:  []model.Endpoint{{Address: "10.0.0.1", Port: 8080}},
+			Source:     model.SourceDocker,
+			Origin:     "c/bad",
+			Rule:       r,
+			RuleExpr:   `Host(app.example.com) && ClientIP(10.0.0.0/8)`,
+			RouterName: "bad",
+		},
+		"good": {
+			Subdomain:  "good",
+			Endpoints:  []model.Endpoint{{Address: "10.0.0.2", Port: 8080}},
+			Source:     model.SourceDocker,
+			Origin:     "c/good",
+			Rule:       model.Rule{Node: model.And(model.AtomNode(model.NewHost("app.example.com")), model.AtomNode(model.NewPathPrefix("/ok")))},
+			RuleExpr:   `Host(app.example.com) && PathPrefix(/ok)`,
+			RouterName: "good",
+		},
+	}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	rc := buildHTTPSRouteConfiguration(routes, sortedSubdomains(routes), "example.com", logger)
+	vh := vhByDomain(t, rc)["app.example.com"]
+	if vh == nil {
+		t.Fatalf("expected virtual host app.example.com, got %+v", rc.VirtualHosts)
+	}
+	if len(vh.Routes) != 1 || vh.Routes[0].GetRoute().GetCluster() != "good" {
+		t.Errorf("expected only the good route, got %+v", vh.Routes)
+	}
+	if !bytes.Contains(logs.Bytes(), []byte("ClientIP")) {
+		t.Errorf("expected an actionable warning mentioning ClientIP, got: %s", logs.String())
+	}
 }

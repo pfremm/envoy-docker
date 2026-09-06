@@ -20,6 +20,12 @@ const (
 
 // Route describes one subdomain's worth of routing: the unique subdomain
 // label and the set of backend endpoints to load balance across.
+//
+// Milestone 1 extends Route with an optional typed matcher AST (Rule), the
+// original rule expression (RuleExpr), an optional explicit integer
+// priority (Priority/PrioritySet), and the originating router name
+// (RouterName). These fields are empty for legacy subdomain-only routes,
+// which match every path on their subdomain (catch-all prefix "/").
 type Route struct {
 	Subdomain string
 	Endpoints []Endpoint
@@ -27,6 +33,22 @@ type Route struct {
 	// Origin is a human-readable identifier of what produced this route
 	// (container name, or static config entry index) used in log messages.
 	Origin string
+
+	// Rule is the parsed, typed matcher expression for this route. It is
+	// empty (Rule.Node == nil) for legacy subdomain-only routes. When set,
+	// it fully determines which requests the route handles.
+	Rule Rule
+	// RuleExpr is the original rule expression string, kept for logging and
+	// as a deterministic specificity proxy when no explicit priority is set.
+	RuleExpr string
+	// Priority is an explicit integer priority. Higher wins. A route with
+	// PrioritySet=true always beats one without, regardless of rule length.
+	Priority    int
+	PrioritySet bool
+	// RouterName is the router's label name (the <name> in
+	// envoy.http.routers.<name>.*). Used as the stable tie-breaker in
+	// precedence ordering.
+	RouterName string
 }
 
 func (r Route) String() string {
