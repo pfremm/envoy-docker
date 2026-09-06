@@ -7,6 +7,7 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	localrlv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/local_ratelimit/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 
@@ -20,6 +21,7 @@ func TestBuildSnapshotForConfigNamedServicePolicies(t *testing.T) {
 	cfg := model.HTTPConfiguration{Routes: map[string]model.Route{"app": {Subdomain: "app", RouterName: "web", ServiceName: "api", Timeout: durationPtr(30 * time.Second), IdleTimeout: durationPtr(5 * time.Second), Retry: &model.RetryPolicy{Attempts: 3, PerTryTimeout: 2 * time.Second, RetryOn: "5xx,reset"}}}, Services: map[string]model.HTTPService{
 		"api": {Name: "api", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}, {Address: "10.0.0.1", Port: 8081}}, Protocol: model.ProtocolHTTPS, HealthCheck: &model.HealthCheck{Path: "/ready", Interval: 7 * time.Second, Timeout: time.Second, UnhealthyThreshold: 4, HealthyThreshold: 2}, Outlier: &model.OutlierDetection{Consecutive5xx: 6, Interval: 11 * time.Second, BaseEjectionTime: 31 * time.Second, MaxEjectionPercent: uint32Ptr(50)}, Sticky: &model.StickyCookie{Name: "affinity", Secure: true, HTTPOnly: true, SameSite: "lax", TTL: time.Hour}},
 	}}
+
 	snap, err := BuildSnapshotForConfig("1", cfg, Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443})
 	if err != nil {
 		t.Fatal(err)
@@ -66,6 +68,7 @@ func TestBuildSnapshotForConfigWeightedServicesAndHTTP2(t *testing.T) {
 		"green":   {Name: "green", Endpoints: []model.Endpoint{{Address: "10.0.0.2", Port: 8080}}, Protocol: model.ProtocolGRPC},
 		"rollout": {Name: "rollout", Weighted: []model.WeightedService{{Name: "green", Weight: 1}, {Name: "blue", Weight: 9}}},
 	}}
+
 	snap, err := BuildSnapshotForConfig("1", cfg, Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443})
 	if err != nil {
 		t.Fatal(err)
@@ -91,6 +94,7 @@ func TestBuildSnapshotForConfigEmitsExplicitZeroMaxEjectionPercent(t *testing.T)
 	cfg := model.HTTPConfiguration{Routes: map[string]model.Route{"app": {Subdomain: "app", ServiceName: "api"}}, Services: map[string]model.HTTPService{
 		"api": {Name: "api", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}, Outlier: &model.OutlierDetection{MaxEjectionPercent: &zero}},
 	}}
+
 	snap, err := BuildSnapshotForConfig("1", cfg, Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443})
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +112,7 @@ func TestBuildSnapshotForConfigLegacyRouteUnchanged(t *testing.T) {
 		Subdomain: "app", RouterName: "web", Source: model.SourceDocker,
 		Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}},
 	}}, Services: map[string]model.HTTPService{}}
+
 	snap, err := BuildSnapshotForConfig("1", cfg, Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443})
 	if err != nil {
 		t.Fatal(err)
@@ -117,12 +122,46 @@ func TestBuildSnapshotForConfigLegacyRouteUnchanged(t *testing.T) {
 	}
 	cla := snap.GetResources(resourcev3.EndpointType)["app"].(*endpointv3.ClusterLoadAssignment)
 	if len(cla.Endpoints[0].LbEndpoints) != 1 {
-		t.Fatalf("endpoints=%+v", cla)
+		t.Fatalf("endpoints=%+v", cla.Endpoints)
 	}
 	rc := snap.GetResources(resourcev3.RouteType)[httpsRouteConfigName].(*routev3.RouteConfiguration)
 	a := rc.VirtualHosts[0].Routes[0].GetRoute()
 	if a.GetCluster() != "app" || a.Timeout != nil || a.RetryPolicy != nil || len(a.HashPolicy) != 0 {
 		t.Fatalf("legacy action must stay plain: %+v", a)
+	}
+}
+
+func TestBuildSnapshotForConfigKeepsPoliciesPerRouterSharingService(t *testing.T) {
+	cfg := model.HTTPConfiguration{
+		Routes: map[string]model.Route{
+			"one": {Subdomain: "one", RouterName: "one", ServiceName: "api", Middlewares: []model.Middleware{{Name: "one-rate", RateLimit: &model.RateLimitMiddleware{Average: 1, Burst: 2, Period: "1s"}}}},
+			"two": {Subdomain: "two", RouterName: "two", ServiceName: "api", Middlewares: []model.Middleware{{Name: "two-rate", RateLimit: &model.RateLimitMiddleware{Average: 3, Burst: 7, Period: "1s"}}}},
+		},
+		Services: map[string]model.HTTPService{"api": {Name: "api", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}}},
+	}
+	snap, err := BuildSnapshotForConfig("1", cfg, Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc := snap.GetResources(resourcev3.RouteType)[httpsRouteConfigName].(*routev3.RouteConfiguration)
+	wantBurst := map[string]uint32{"one": 2, "two": 7}
+	seen := map[string]bool{}
+	for _, vh := range rc.VirtualHosts {
+		for _, er := range vh.Routes {
+			want, ok := wantBurst[er.Name]
+			if !ok {
+				continue
+			}
+			cfg := &localrlv3.LocalRateLimit{}
+			unmarshalAny(t, er.TypedPerFilterConfig[localRLFilterName], cfg)
+			if got := cfg.GetTokenBucket().GetMaxTokens(); got != want {
+				t.Fatalf("router %q burst = %d, want %d", er.Name, got, want)
+			}
+			seen[er.Name] = true
+		}
+	}
+	if !seen["one"] || !seen["two"] {
+		t.Fatalf("missing named routes, seen %v", seen)
 	}
 }
 

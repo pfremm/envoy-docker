@@ -123,3 +123,17 @@ func TestNoMiddlewarePreservesLegacyRouteShape(t *testing.T) {
 		t.Fatalf("legacy route changed: %+v", r)
 	}
 }
+
+func TestApplyRouteMiddlewares_BasicAuthRemoveHeader(t *testing.T) {
+	r := middlewareRoute(t, model.Middleware{Name: "auth", BasicAuth: &model.BasicAuthMiddleware{
+		Users: []string{"alice:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g="}, RemoveHeader: true,
+	}})
+	cfg := &luav3.LuaPerRoute{}
+	if err := r.TypedPerFilterConfig[basicAuthRemoveFilterName].UnmarshalTo(cfg); err != nil {
+		t.Fatal(err)
+	}
+	source := cfg.GetSourceCode().GetInlineString()
+	if !strings.Contains(source, `remove("authorization")`) {
+		t.Fatalf("basic auth removeheader did not compile to the final cleanup filter: %s", source)
+	}
+}

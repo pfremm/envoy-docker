@@ -168,6 +168,11 @@ standard middleware stack. Unsupported orderings reject only that router.
 | `replacepathregex` | `regex`, `replacement` (required) |
 | `headers` | `request.<header>`, `response.<header>`, `removerequest`, `removeresponse` |
 | `cors` | `alloworigins` (required list), `allowmethods`, `allowheaders`, `exposeheaders`, `maxage`, `allowcredentials` |
+| `basicauth` | `users` (required `user:htpasswd-hash` list), `realm`, `headerfield`, `removeheader` |
+| `forwardauth` | `address` (required HTTP(S) URL or host/port), `trustforwardheader`, `authrequestheaders`, `authresponseheaders`, `authresponseheaderregex`, `tls.insecure`, `tls.servername` |
+| `ipallowlist` | `sourcerange` (required CIDR/IP list), `ipstrategy.depth`, `ipstrategy.excludedips` |
+| `ipdenylist` | `sourcerange` (required CIDR/IP list), `ipstrategy.depth`, `ipstrategy.excludedips` |
+| `ratelimit` | `average`, `burst`, `period` (all required; `period` must be at least `50ms`) |
 
 Regexes are validated when labels are parsed. Invalid expressions never reach
 xDS. Replacements accept Go/Traefik capture references (`$1` or `${1}`), which
@@ -201,10 +206,65 @@ envoy.http.middlewares.site-cors.cors.allowmethods: GET,POST,OPTIONS
 ```
 
 Do not combine a base list label and indexed labels for the same field.
-Indexed syntax is accepted for `prefixes`, `removerequest`, `removeresponse`,
-`alloworigins`, `allowmethods`, `allowheaders`, and `exposeheaders`. Docker
+Indexed syntax is accepted for every list field, including `prefixes`,
+header/CORS lists, `users`, auth header lists, `sourcerange`, and
+`ipstrategy.excludedips`. Docker
 label maps cannot repeat an identical key, so indexing is the repeated-value
 form.
+
+#### Security middleware
+
+Basic auth credentials are emitted only into Envoy's sensitive xDS data source
+and are redacted from control-plane diagnostics. The pinned Envoy native
+`basic_auth` filter currently accepts only Apache htpasswd `{SHA}` entries, so
+other algorithms are rejected during model validation before xDS publication.
+In Compose interpolation, any literal dollar in a future/alternate Envoy build's
+supported hash must be doubled (`$2y$...` becomes `$$2y$$...` in YAML). `headerfield`
+forwards the authenticated username to that upstream header. `removeheader`
+removes `Authorization` only after authentication succeeds. A custom `realm`
+is applied to 401 responses by a pre-auth response-only Lua filter.
+
+Forward auth is fail-closed: an auth-server denial, error, or timeout does not
+reach the upstream. Checks have a fixed two-second upper bound and use an
+explicit static auth cluster. `authresponseheaders` and its regex variant copy
+successful auth response headers into the upstream request. Enabling
+`trustforwardheader` deliberately forwards existing `X-Forwarded-*` identity
+headers to the auth service; only do this behind a proxy that overwrites or
+sanitizes those headers. An `http://` address selects plaintext. HTTPS verifies
+the system CA and upstream identity by default; `tls.insecure=true` keeps TLS
+but disables certificate verification and must not be used across an untrusted
+network. `tls.servername` overrides the TLS SNI name. A path in the auth
+address is emitted as Envoy's authorization path prefix; query strings and
+fragments are rejected because Envoy HTTP ext_authz cannot represent them
+without silently changing the request. Envoy's native `basic_auth` cannot be
+disabled per route, so when BasicAuth is used every published route must opt
+into it. ForwardAuth can be selective: routes without it receive an explicit
+disabled override rather than inheriting the listener's default auth service.
+Mixed BasicAuth coverage is rejected rather than accidentally changing access.
+
+IP allow/deny rules use only Envoy's direct downstream peer by default, so a
+client-supplied `X-Forwarded-For` cannot bypass them. `ipstrategy.depth=N`
+explicitly trusts N right-most proxy hops. `ipstrategy.excludedips` instead
+configures those CIDRs as trusted proxy hops; depth and excluded IPs are
+mutually exclusive. Both modes trust forwarding metadata and are spoofable if
+the direct peer is not a controlled proxy. Because original-IP detection is an
+HTTP-listener property, routes that opt into XFF must agree on one strategy;
+conflicting strategies reject the snapshot rather than silently weakening it.
+
+Rate limiting uses Envoy's native local token bucket. `burst` is the bucket
+capacity; `average` tokens are refilled each `period`. Buckets are per route
+and local to one Envoy proxy process. They are not distributed/global limits,
+so N replicas permit roughly N times the configured aggregate rate.
+
+Security filters have unavoidable Envoy filter-phase ordering: local rate
+limit, realm response hook (when needed), basic auth, and IP RBAC run first;
+request mutation follows, then forward auth sees the final path and headers,
+BasicAuth credential removal runs after all auth checks, and CORS/routing
+finish the chain. Order is preserved within the mutation family and response
+mutations unwind in reverse. Security types cannot be arbitrarily interleaved
+per route because Envoy installs HTTP filter implementations listener-wide;
+the fixed phase order is deterministic and documented rather than inferred
+from map iteration.
 
 #### Complete mutation example
 

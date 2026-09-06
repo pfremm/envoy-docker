@@ -106,3 +106,51 @@ func TestDiscoverResolvesMiddlewareOrderAndIsolatesUnknownReference(t *testing.T
 		t.Fatalf("missing actionable log: %s", logs.String())
 	}
 }
+
+func TestParseSecurityMiddlewareVariants(t *testing.T) {
+	got, bad, err := parseMiddlewares(map[string]string{
+		"envoy.http.middlewares.basic.basicauth.users":                    "alice:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=,bob:{SHA}2jmj7l5rSw0yVb/vlWAYkK/YBwk=",
+		"envoy.http.middlewares.basic.basicauth.realm":                    "private",
+		"envoy.http.middlewares.basic.basicauth.headerfield":              "X-Authenticated-User",
+		"envoy.http.middlewares.basic.basicauth.removeheader":             "true",
+		"envoy.http.middlewares.auth.forwardauth.address":                 "auth.internal:8443",
+		"envoy.http.middlewares.auth.forwardauth.trustforwardheader":      "true",
+		"envoy.http.middlewares.auth.forwardauth.authrequestheaders":      "X-Token,X-Scope",
+		"envoy.http.middlewares.auth.forwardauth.authresponseheaders":     "X-User",
+		"envoy.http.middlewares.auth.forwardauth.authresponseheaderregex": "^X-Group-.*$",
+		"envoy.http.middlewares.auth.forwardauth.tls.insecure":            "true",
+		"envoy.http.middlewares.auth.forwardauth.tls.servername":          "auth.internal",
+		"envoy.http.middlewares.allow.ipallowlist.sourcerange":            "10.0.0.0/8,2001:db8::/32",
+		"envoy.http.middlewares.allow.ipallowlist.ipstrategy.depth":       "2",
+		"envoy.http.middlewares.deny.ipdenylist.sourcerange":              "192.0.2.0/24",
+		"envoy.http.middlewares.deny.ipdenylist.ipstrategy.excludedips":   "10.0.0.0/8",
+		"envoy.http.middlewares.local.ratelimit.average":                  "10",
+		"envoy.http.middlewares.local.ratelimit.burst":                    "20",
+		"envoy.http.middlewares.local.ratelimit.period":                   "1s",
+	})
+	if err != nil || len(bad) != 0 {
+		t.Fatalf("security parser failed: bad=%v err=%v", bad, err)
+	}
+	if len(got) != 5 || !got["basic"].BasicAuth.RemoveHeader || !got["auth"].ForwardAuth.TrustForwardHeader || got["allow"].IPAllowList.Strategy.Depth != 2 || got["local"].RateLimit.Burst != 20 {
+		t.Fatalf("security variants not parsed correctly: %+v", got)
+	}
+}
+
+func TestParseSecurityMiddlewareFailuresAreIsolated(t *testing.T) {
+	_, bad, err := parseMiddlewares(map[string]string{
+		"envoy.http.middlewares.auth.forwardauth.address":            "auth.internal",
+		"envoy.http.middlewares.auth.forwardauth.trustforwardheader": "sometimes",
+		"envoy.http.middlewares.allow.ipallowlist.sourcerange":       "invalid",
+		"envoy.http.middlewares.rate.ratelimit.average":              "zero",
+		"envoy.http.middlewares.rate.ratelimit.burst":                "5",
+		"envoy.http.middlewares.rate.ratelimit.period":               "1s",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"auth", "allow", "rate"} {
+		if bad[name] == nil {
+			t.Errorf("%s should have an isolated parse/validation error: %v", name, bad)
+		}
+	}
+}
