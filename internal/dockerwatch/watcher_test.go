@@ -1,6 +1,7 @@
 package dockerwatch
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -141,7 +142,7 @@ func TestParseRouters(t *testing.T) {
 				if !ok {
 					t.Fatalf("parseRouters() missing router %q, got %+v", name, got)
 				}
-				if gotRouter != wantRouter {
+				if !reflect.DeepEqual(gotRouter, wantRouter) {
 					t.Fatalf("parseRouters()[%q] = %+v, want %+v", name, gotRouter, wantRouter)
 				}
 			}

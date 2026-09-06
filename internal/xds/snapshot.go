@@ -14,6 +14,8 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	corsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
+	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
@@ -25,6 +27,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
 )
@@ -267,18 +270,23 @@ func buildVirtualHost(domain string, routes []model.Route, logger *slog.Logger) 
 func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Route {
 	// Legacy: no rule -> single catch-all prefix "/" route.
 	if route.Rule.Node == nil {
-		return []*routev3.Route{
-			{
-				Match: &routev3.RouteMatch{
-					PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
-				},
-				Action: &routev3.Route_Route{
-					Route: &routev3.RouteAction{
-						ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: route.ClusterName()},
-					},
+		er := &routev3.Route{
+			Match: &routev3.RouteMatch{
+				PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
+			},
+			Action: &routev3.Route_Route{
+				Route: &routev3.RouteAction{
+					ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: route.ClusterName()},
 				},
 			},
 		}
+		if err := applyRouteMiddlewares(er, route.Middlewares); err != nil {
+			if logger != nil {
+				logger.Warn("skipping router: invalid middleware chain", "router", route.RouterName, "error", err)
+			}
+			return nil
+		}
+		return []*routev3.Route{er}
 	}
 
 	// Reject rules that cannot be expressed as Envoy route matches.
@@ -317,14 +325,21 @@ func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Rout
 			}
 			return nil
 		}
-		out = append(out, &routev3.Route{
+		er := &routev3.Route{
 			Match: match,
 			Action: &routev3.Route_Route{
 				Route: &routev3.RouteAction{
 					ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: route.ClusterName()},
 				},
 			},
-		})
+		}
+		if err := applyRouteMiddlewares(er, route.Middlewares); err != nil {
+			if logger != nil {
+				logger.Warn("skipping router: invalid middleware chain", "router", route.RouterName, "error", err)
+			}
+			return nil
+		}
+		out = append(out, er)
 	}
 	return out
 }
@@ -517,7 +532,7 @@ func buildHTTPSListener(port uint32, certSecretName, acmeSDSClusterName string) 
 				ConfigSource:    adsConfigSource(),
 			},
 		},
-		HttpFilters: []*hcmv3.HttpFilter{routerHTTPFilter()},
+		HttpFilters: []*hcmv3.HttpFilter{mutationHTTPFilter(), corsHTTPFilter(), routerHTTPFilter()},
 	}
 
 	tlsContext := &tlsv3.DownstreamTlsContext{
@@ -549,6 +564,15 @@ func buildHTTPSListener(port uint32, certSecretName, acmeSDSClusterName string) 
 			},
 		},
 	}
+}
+
+func corsHTTPFilter() *hcmv3.HttpFilter {
+	return &hcmv3.HttpFilter{Name: corsFilterName, ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mustAny(&corsv3.Cors{})}}
+}
+
+func mutationHTTPFilter() *hcmv3.HttpFilter {
+	noop := &corev3.DataSource{Specifier: &corev3.DataSource_InlineString{InlineString: "function envoy_on_request(handle) end\n"}}
+	return &hcmv3.HttpFilter{Name: mutationFilterName, ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mustAny(&luav3.Lua{DefaultSourceCode: noop, ClearRouteCache: wrapperspb.Bool(false)})}}
 }
 
 func routerHTTPFilter() *hcmv3.HttpFilter {
