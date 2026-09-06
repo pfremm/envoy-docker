@@ -11,6 +11,7 @@ import (
 	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
@@ -19,6 +20,9 @@ import (
 const (
 	mutationFilterName = "envoy.filters.http.lua"
 	corsFilterName     = "envoy.filters.http.cors"
+	compressorFilterName = "envoy.filters.http.compressor"
+	bufferFilterName     = "envoy.filters.http.buffer"
+	grpcWebFilterName    = "envoy.filters.http.grpc_web"
 )
 
 func applyRouteMiddlewares(er *routev3.Route, chain []model.Middleware) error {
@@ -37,6 +41,13 @@ func applyRouteMiddlewares(er *routev3.Route, chain []model.Middleware) error {
 	if er.TypedPerFilterConfig != nil {
 		delete(er.TypedPerFilterConfig, mutationFilterName)
 		delete(er.TypedPerFilterConfig, corsFilterName)
+		delete(er.TypedPerFilterConfig, compressorFilterName)
+		delete(er.TypedPerFilterConfig, bufferFilterName)
+		delete(er.TypedPerFilterConfig, grpcWebFilterName)
+	}
+	// Retry policy is on the RouteAction, not per-filter config
+	if ra := er.GetRoute(); ra != nil {
+		ra.RetryPolicy = nil
 	}
 	var mutationOps []model.Middleware
 	for _, m := range chain {
@@ -66,6 +77,29 @@ func applyRouteMiddlewares(er *routev3.Route, chain []model.Middleware) error {
 				er.TypedPerFilterConfig = map[string]*anypb.Any{}
 			}
 			er.TypedPerFilterConfig[corsFilterName] = mustAny(corsPolicy(m.CORS))
+		case m.Retry != nil:
+			if ra := er.GetRoute(); ra != nil {
+				timeout, _ := parseDuration(m.Retry.PerTryTimeout)
+				ra.RetryPolicy = &routev3.RetryPolicy{
+					RetryOn:       m.Retry.RetryOn,
+					NumRetries:    wrapperspb.UInt32(m.Retry.Attempts),
+					PerTryTimeout: durationpb.New(timeout),
+				}
+			}
+		case m.Buffering != nil:
+			if er.TypedPerFilterConfig == nil {
+				er.TypedPerFilterConfig = map[string]*anypb.Any{}
+			}
+			er.TypedPerFilterConfig[bufferFilterName] = mustAny(bufferPerRoute(m.Buffering))
+		case m.Compress != nil:
+			// Compression is listener-level in Envoy v1.37; per-route config is too limited.
+			// Handled in planSecurity/listener assembly instead.
+		case m.GRPCWeb != nil:
+			// gRPC-Web is listener-level; handled in planSecurity/listener assembly.
+		case m.CircuitBreaker != nil:
+			// Circuit breakers are cluster-scoped; handled in cluster building.
+		case m.Errors != nil:
+			// Error pages require internal redirect; handled in route building.
 		}
 	}
 	if len(mutationOps) > 0 {
