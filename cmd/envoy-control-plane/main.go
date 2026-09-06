@@ -71,14 +71,15 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	updates := make(chan map[string]model.Route)
+	updates := make(chan model.HTTPConfiguration)
 
 	var version atomic.Uint64
 
-	applyUpdate := func(dockerRoutes map[string]model.Route) error {
-		merged := xds.Merge(dockerRoutes, staticRoutes, logger)
+	applyUpdate := func(dockerConfig model.HTTPConfiguration) error {
+		merged := xds.Merge(dockerConfig.Routes, staticRoutes, logger)
+		httpConfig := model.HTTPConfiguration{Routes: merged, Services: dockerConfig.Services}
 		v := version.Add(1)
-		snap, err := xds.BuildSnapshot(strconv.FormatUint(v, 10), merged, snapCfg)
+		snap, err := xds.BuildSnapshotForConfig(strconv.FormatUint(v, 10), httpConfig, snapCfg)
 		if err != nil {
 			return fmt.Errorf("building snapshot: %w", err)
 		}
@@ -96,7 +97,7 @@ func run(logger *slog.Logger) error {
 	// Publish once immediately with just the static routes (if any), so
 	// static-only backends stay routable even if the docker daemon is
 	// unreachable or slow to answer the first scan.
-	if err := applyUpdate(map[string]model.Route{}); err != nil {
+	if err := applyUpdate(model.HTTPConfiguration{Routes: map[string]model.Route{}, Services: map[string]model.HTTPService{}}); err != nil {
 		logger.Error("failed to publish initial snapshot", "error", err)
 	}
 
