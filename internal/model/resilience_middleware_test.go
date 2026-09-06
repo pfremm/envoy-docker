@@ -304,6 +304,65 @@ func TestCompressMiddlewareValidation(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "excludedcontenttypes rejected as unsupported",
+			mw: Middleware{
+				Name: "bad-compress-excluded",
+				Compress: &CompressMiddleware{
+					ExcludedContentTypes: []string{"image/png"},
+				},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.mw.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestBufferingMiddlewareRejectsUnsupportedFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		mw      Middleware
+		wantErr bool
+	}{
+		{
+			name: "maxresponsebytes rejected as unsupported",
+			mw: Middleware{
+				Name:      "bad-buffer-resp",
+				Buffering: &BufferingMiddleware{MaxRequestBytes: 1024, MaxResponseBytes: 2048},
+			},
+			wantErr: true,
+		},
+		{
+			name: "memrequestbytes rejected as unsupported",
+			mw: Middleware{
+				Name:      "bad-buffer-mem",
+				Buffering: &BufferingMiddleware{MaxRequestBytes: 1024, MemRequestBytes: 512},
+			},
+			wantErr: true,
+		},
+		{
+			name: "memresponsebytes rejected as unsupported",
+			mw: Middleware{
+				Name:      "bad-buffer-mem-resp",
+				Buffering: &BufferingMiddleware{MaxRequestBytes: 1024, MemResponseBytes: 512},
+			},
+			wantErr: true,
+		},
+		{
+			name: "maxrequestbytes required",
+			mw: Middleware{
+				Name:      "bad-buffer-zero",
+				Buffering: &BufferingMiddleware{},
+			},
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

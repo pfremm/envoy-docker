@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	mutationFilterName = "envoy.filters.http.lua"
-	corsFilterName     = "envoy.filters.http.cors"
+	mutationFilterName   = "envoy.filters.http.lua"
+	corsFilterName       = "envoy.filters.http.cors"
 	compressorFilterName = "envoy.filters.http.compressor"
 	bufferFilterName     = "envoy.filters.http.buffer"
 	grpcWebFilterName    = "envoy.filters.http.grpc_web"

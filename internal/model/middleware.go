@@ -93,29 +93,29 @@ type RateLimitMiddleware struct {
 // compression when a weak or strong ETag exists. Gzip is always enabled; brotli
 // is enabled only if the linked Envoy build supports it (verified at build time).
 type CompressMiddleware struct {
-	MinResponseBytes      uint32
-	ContentTypes          []string
-	ExcludedContentTypes  []string
-	DisableOnETagHeader   bool
+	MinResponseBytes     uint32
+	ContentTypes         []string
+	ExcludedContentTypes []string
+	DisableOnETagHeader  bool
 }
 
 // RetryMiddleware configures Envoy's per-route retry policy. Attempts is the
 // maximum number of tries (including the original request). PerTryTimeout is the
 // timeout for each individual attempt. RetryOn is an Envoy retry condition string.
 type RetryMiddleware struct {
-	Attempts        uint32
-	PerTryTimeout   string
-	RetryOn         string
+	Attempts      uint32
+	PerTryTimeout string
+	RetryOn       string
 }
 
 // CircuitBreakerMiddleware configures Envoy cluster-scoped circuit breaker
 // thresholds. Because breakers are cluster-scoped, the xDS layer derives
 // deterministic cluster variants when policies differ and deduplicates identical ones.
 type CircuitBreakerMiddleware struct {
-	MaxConnections      uint32
-	MaxPendingRequests  uint32
-	MaxRequests         uint32
-	MaxRetries          uint32
+	MaxConnections     uint32
+	MaxPendingRequests uint32
+	MaxRequests        uint32
+	MaxRetries         uint32
 }
 
 // BufferingMiddleware configures Envoy's buffer filter. MaxRequestBytes and
@@ -123,11 +123,11 @@ type CircuitBreakerMiddleware struct {
 // set in-memory buffer limits before spilling to disk. RetryExpression is unsupported
 // and rejected.
 type BufferingMiddleware struct {
-	MaxRequestBytes   uint32
-	MaxResponseBytes  uint32
-	MemRequestBytes   uint32
-	MemResponseBytes  uint32
-	RetryExpression   string
+	MaxRequestBytes  uint32
+	MaxResponseBytes uint32
+	MemRequestBytes  uint32
+	MemResponseBytes uint32
+	RetryExpression  string
 }
 
 // ErrorsMiddleware configures custom error-page handling. Status is a comma-separated
@@ -311,6 +311,23 @@ func ValidateMiddlewareChain(chain []Middleware) error {
 			filter = "rbac"
 		case m.RateLimit != nil:
 			filter = "local_ratelimit"
+		// Resilience/protocol middleware are each a singleton concept at the
+		// listener, cluster, or route level: two of the same type in one
+		// chain would be ambiguous (which policy wins?) rather than a
+		// deliberate composition, so reject it the same way security
+		// filters are protected from silent overwrite.
+		case m.Retry != nil:
+			filter = "retry"
+		case m.Compress != nil:
+			filter = "compress"
+		case m.CircuitBreaker != nil:
+			filter = "circuitbreaker"
+		case m.Buffering != nil:
+			filter = "buffering"
+		case m.Errors != nil:
+			filter = "errors"
+		case m.GRPCWeb != nil:
+			filter = "grpcweb"
 		}
 		if filter != "" {
 			if prior := securityFilters[filter]; prior != "" {
@@ -528,10 +545,12 @@ func (m Middleware) Validate() error {
 				return fmt.Errorf("middleware %q compress.contenttypes cannot contain empty values", m.Name)
 			}
 		}
-		for _, ct := range m.Compress.ExcludedContentTypes {
-			if strings.TrimSpace(ct) == "" {
-				return fmt.Errorf("middleware %q compress.excludedcontenttypes cannot contain empty values", m.Name)
-			}
+		// Envoy's compressor filter only exposes an allow-list
+		// (content_type on CommonDirectionConfig); there is no native
+		// deny-list. Reject rather than silently ignoring so a
+		// configured exclusion is never mistaken for enforced behavior.
+		if len(m.Compress.ExcludedContentTypes) > 0 {
+			return fmt.Errorf("middleware %q compress.excludedcontenttypes is not supported by this Envoy build (the compressor filter only exposes an allow-list via contenttypes, no deny-list); omit it or use contenttypes instead", m.Name)
 		}
 	case "retry":
 		if m.Retry.Attempts == 0 {
@@ -552,11 +571,24 @@ func (m Middleware) Validate() error {
 			return fmt.Errorf("middleware %q circuitbreaker must configure at least one threshold", m.Name)
 		}
 	case "buffering":
+		// Envoy's buffer filter (envoy.filters.http.buffer) only exposes
+		// max_request_bytes; it has no response-body limit and no
+		// in-memory-vs-disk spill knob. Reject the unsupported settings
+		// clearly instead of silently dropping them.
 		if m.Buffering.RetryExpression != "" {
 			return fmt.Errorf("middleware %q buffering.retryexpression is not supported by this Envoy build", m.Name)
 		}
-		if m.Buffering.MaxRequestBytes == 0 && m.Buffering.MaxResponseBytes == 0 {
-			return fmt.Errorf("middleware %q buffering must configure at least one max size", m.Name)
+		if m.Buffering.MaxResponseBytes != 0 {
+			return fmt.Errorf("middleware %q buffering.maxresponsebytes is not supported by this Envoy build (the buffer filter only limits request bodies); omit it", m.Name)
+		}
+		if m.Buffering.MemRequestBytes != 0 {
+			return fmt.Errorf("middleware %q buffering.memrequestbytes is not supported by this Envoy build (the buffer filter has no in-memory-vs-disk spill setting); omit it", m.Name)
+		}
+		if m.Buffering.MemResponseBytes != 0 {
+			return fmt.Errorf("middleware %q buffering.memresponsebytes is not supported by this Envoy build (the buffer filter has no in-memory-vs-disk spill setting); omit it", m.Name)
+		}
+		if m.Buffering.MaxRequestBytes == 0 {
+			return fmt.Errorf("middleware %q buffering.maxrequestbytes is required (the only supported buffering threshold)", m.Name)
 		}
 	case "errors":
 		if len(m.Errors.Status) == 0 {

@@ -86,6 +86,21 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 				return nil, fmt.Errorf("router %q: %w", route.RouterName, err)
 			}
 		}
+		for _, m := range route.Middlewares {
+			if m.Errors != nil {
+				if _, ok := httpCfg.Services[m.Errors.Service]; !ok {
+					return nil, fmt.Errorf("router %q: errors middleware %q references service %q, which is not a named HTTP service (envoy.http.services.%s.*)", route.RouterName, m.Name, m.Errors.Service, m.Errors.Service)
+				}
+			}
+			if m.GRPCWeb != nil {
+				if err := validateGRPCWebUpstream(route, httpCfg); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	if err := validateNoErrorRecursion(httpCfg.Routes); err != nil {
+		return nil, err
 	}
 
 	routeConfig := buildHTTPSRouteConfiguration(httpCfg.Routes, sortedSubdomains(httpCfg.Routes), cfg.BaseDomain, nil)
@@ -136,6 +151,68 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 		clusterResources = append(clusterResources, c)
 	}
 
+	// Circuit breakers are cluster-scoped: derive deterministic variant
+	// clusters for routes whose circuitbreaker middleware policy differs
+	// from sibling routes sharing the same base cluster, and apply the
+	// policy directly when every sharer agrees (no variant needed). A
+	// route's base cluster is its own dedicated cluster for legacy routes,
+	// or the named service's cluster when the route selects a single
+	// (non-weighted) named service. A route selecting a weighted service
+	// has no single base cluster to vary, so circuitbreaker on such a
+	// route is rejected rather than silently ignored.
+	baseClusters := map[string]*clusterv3.Cluster{}
+	baseEndpoints := map[string]*endpointv3.ClusterLoadAssignment{}
+	for _, res := range clusterResources {
+		if c, ok := res.(*clusterv3.Cluster); ok {
+			baseClusters[c.Name] = c
+		}
+	}
+	for _, res := range endpointResources {
+		if ep, ok := res.(*endpointv3.ClusterLoadAssignment); ok {
+			baseEndpoints[ep.ClusterName] = ep
+		}
+	}
+	var cbRefs []circuitBreakerRef
+	for _, name := range sortedSubdomains(published) {
+		route := published[name]
+		for _, m := range route.Middlewares {
+			if m.CircuitBreaker == nil {
+				continue
+			}
+			baseCluster := route.ClusterName()
+			if route.ServiceName != "" {
+				svc := httpCfg.Services[route.ServiceName]
+				if len(svc.Weighted) > 0 {
+					return nil, fmt.Errorf("router %q: circuitbreaker middleware cannot be combined with a weighted-service route; there is no single base cluster to vary", route.RouterName)
+				}
+				baseCluster = model.NamedServiceClusterName(route.ServiceName)
+			}
+			cbRefs = append(cbRefs, circuitBreakerRef{
+				routeKey:    routeResourceName(route),
+				baseCluster: baseCluster,
+				policy:      m.CircuitBreaker,
+			})
+		}
+	}
+	var cbRouteOverride map[string]string
+	if len(cbRefs) > 0 {
+		variantClusters, variantEndpoints, routeOverride, err := planCircuitBreakerVariants(cbRefs, baseClusters, baseEndpoints)
+		if err != nil {
+			return nil, fmt.Errorf("planning circuit breaker variants: %w", err)
+		}
+		for _, c := range variantClusters {
+			if prior, exists := clusterNames[c.Name]; exists {
+				return nil, fmt.Errorf("xDS cluster name %q collides between %s and a circuit-breaker variant", c.Name, prior)
+			}
+			clusterNames[c.Name] = "circuit-breaker variant"
+			clusterResources = append(clusterResources, c)
+		}
+		for _, ep := range variantEndpoints {
+			endpointResources = append(endpointResources, ep)
+		}
+		cbRouteOverride = routeOverride
+	}
+
 	byRouteName := map[string]model.Route{}
 	for _, r := range published {
 		name := routeResourceName(r)
@@ -160,6 +237,18 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 			}
 			applyRouteSecurity(er, r.Middlewares)
 		}
+	}
+	if len(cbRouteOverride) > 0 {
+		redirectRouteClusters(routeConfig, cbRouteOverride)
+	}
+	if len(plan.errorServiceNames) > 0 {
+		errorVHosts := errorServiceVirtualHosts(plan.errorServiceNames, func(name string) (string, bool) {
+			if _, ok := httpCfg.Services[name]; !ok {
+				return "", false
+			}
+			return model.NamedServiceClusterName(name), true
+		})
+		routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, errorVHosts...)
 	}
 	applySecurityDefaults(routeConfig, plan)
 

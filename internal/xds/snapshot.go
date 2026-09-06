@@ -81,6 +81,10 @@ func BuildSnapshot(version string, routes map[string]model.Route, cfg Config) (c
 // route match (e.g. ClientIP, or negation on a non-header matcher) are
 // skipped with an actionable warning instead of failing the whole snapshot.
 func BuildSnapshotWithLogger(version string, routes map[string]model.Route, cfg Config, logger *slog.Logger) (cachev3.ResourceSnapshot, error) {
+	if err := validateNoErrorRecursion(routes); err != nil {
+		return nil, err
+	}
+
 	names := sortedSubdomains(routes)
 	routeConfig := buildHTTPSRouteConfiguration(routes, names, cfg.BaseDomain, logger)
 	published := publishedRoutes(routes, routeConfig)
@@ -110,6 +114,63 @@ func BuildSnapshotWithLogger(version string, routes map[string]model.Route, cfg 
 		clusters = append(clusters, c)
 	}
 
+	// Circuit breakers are cluster-scoped: derive deterministic variant
+	// clusters for routes whose circuitbreaker middleware policy differs
+	// from sibling routes sharing the same base cluster, and apply the
+	// policy directly when every sharer agrees (no variant needed).
+	baseClusters := map[string]*clusterv3.Cluster{}
+	baseEndpoints := map[string]*endpointv3.ClusterLoadAssignment{}
+	for _, res := range clusters {
+		if c, ok := res.(*clusterv3.Cluster); ok {
+			baseClusters[c.Name] = c
+		}
+	}
+	for _, res := range endpoints {
+		if ep, ok := res.(*endpointv3.ClusterLoadAssignment); ok {
+			baseEndpoints[ep.ClusterName] = ep
+		}
+	}
+	var cbRefs []circuitBreakerRef
+	for _, name := range sortedSubdomains(published) {
+		route := published[name]
+		for _, m := range route.Middlewares {
+			if m.CircuitBreaker != nil {
+				cbRefs = append(cbRefs, circuitBreakerRef{
+					routeKey:    routeResourceName(route),
+					baseCluster: route.ClusterName(),
+					policy:      m.CircuitBreaker,
+				})
+			}
+		}
+	}
+	if len(cbRefs) > 0 {
+		variantClusters, variantEndpoints, routeOverride, err := planCircuitBreakerVariants(cbRefs, baseClusters, baseEndpoints)
+		if err != nil {
+			return nil, fmt.Errorf("planning circuit breaker variants: %w", err)
+		}
+		for _, c := range variantClusters {
+			clusters = append(clusters, c)
+		}
+		for _, ep := range variantEndpoints {
+			endpoints = append(endpoints, ep)
+		}
+		if len(routeOverride) > 0 {
+			redirectRouteClusters(routeConfig, routeOverride)
+		}
+	}
+
+	if len(plan.errorServiceNames) > 0 {
+		errorVHosts := errorServiceVirtualHosts(plan.errorServiceNames, func(name string) (string, bool) {
+			for _, r := range routes {
+				if r.ServiceName == "" && r.Subdomain == name {
+					return r.ClusterName(), true
+				}
+			}
+			return "", false
+		})
+		routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, errorVHosts...)
+	}
+
 	httpListener := buildHTTPListener(cfg.HTTPPort)
 	httpsListener := buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName, plan)
 	applySecurityDefaults(routeConfig, plan)
@@ -126,6 +187,23 @@ func BuildSnapshotWithLogger(version string, routes map[string]model.Route, cfg 
 		return nil, fmt.Errorf("building snapshot: %w", err)
 	}
 	return snap, nil
+}
+
+// redirectRouteClusters rewrites RouteAction.Cluster for every route whose
+// resource name appears in routeOverride, pointing it at the derived
+// circuit-breaker variant cluster instead of its base cluster.
+func redirectRouteClusters(rc *routev3.RouteConfiguration, routeOverride map[string]string) {
+	for _, vh := range rc.VirtualHosts {
+		for _, er := range vh.Routes {
+			variant, ok := routeOverride[er.Name]
+			if !ok {
+				continue
+			}
+			if ra := er.GetRoute(); ra != nil {
+				ra.ClusterSpecifier = &routev3.RouteAction_Cluster{Cluster: variant}
+			}
+		}
+	}
 }
 
 func buildCluster(name string) *clusterv3.Cluster {
@@ -594,6 +672,20 @@ func buildHTTPSListener(port uint32, certSecretName, acmeSDSClusterName string, 
 	// mutation or hide credentials from ForwardAuth in a composed chain.
 	if basicAuthRemoveFilter != nil {
 		filters = append(filters, basicAuthRemoveFilter)
+	}
+	// gRPC-Web must run before CORS: it rewrites the gRPC-Web request into
+	// standard gRPC framing on the way in and translates the trailers-only
+	// gRPC response back on the way out, and CORS preflight handling for a
+	// browser-originated gRPC-Web call must see the grpc-web request shape.
+	if plan.needGRPCWeb {
+		filters = append(filters, grpcWebHTTPFilter())
+	}
+	// Compression runs late (after routing decisions are effectively fixed
+	// but before the router itself) so it compresses exactly the response
+	// bytes the client will receive, after any other response mutation.
+	filters = append(filters, buildCompressorFilters(plan.compressConfig)...)
+	if plan.needCustomResponse {
+		filters = append(filters, customResponseHTTPFilter())
 	}
 	filters = append(filters, corsHTTPFilter(), routerHTTPFilter())
 

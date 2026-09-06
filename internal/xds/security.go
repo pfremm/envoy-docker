@@ -66,6 +66,25 @@ type securityPlan struct {
 	authClusters      []*clusterv3.Cluster
 	xffNumTrustedHops uint32
 	xffTrustedCIDRs   []string
+
+	// compressConfig is the single, merged compress middleware configuration
+	// applied listener-wide when non-nil. Envoy's compressor filter is
+	// listener-scoped, so (like BasicAuth's username header) every route
+	// referencing a compress middleware must agree on identical settings;
+	// planSecurity rejects conflicting definitions rather than picking one
+	// arbitrarily.
+	compressConfig *model.CompressMiddleware
+	// needGRPCWeb is true when at least one route references a grpcweb
+	// middleware, installing the listener-wide grpc_web filter.
+	needGRPCWeb bool
+	// needCustomResponse is true when at least one route references an
+	// errors middleware, installing the listener-wide custom_response
+	// filter (its actual behavior is entirely per-route override).
+	needCustomResponse bool
+	// errorServiceNames are the distinct named HTTP services referenced by
+	// every errors.service across all routes, used to synthesize the
+	// internal-redirect target virtual hosts.
+	errorServiceNames []string
 }
 
 // planSecurity inspects every route's middleware chain and produces the
@@ -81,12 +100,28 @@ func planSecurity(routes map[string]model.Route) (*securityPlan, error) {
 		authServices                                                                                = map[string]*authService{}
 		firstForwardAuth                                                                            *model.ForwardAuthMiddleware
 		firstForwardAuthCluster                                                                     string
+		errorServiceSet                                                                             = map[string]bool{}
 	)
 
 	names := sortedSubdomains(routes)
 	for _, name := range names {
 		route := routes[name]
 		for _, m := range route.Middlewares {
+			switch {
+			case m.Compress != nil:
+				if p.compressConfig == nil {
+					p.compressConfig = m.Compress
+				} else if !compressConfigsEqual(p.compressConfig, m.Compress) {
+					return nil, fmt.Errorf(
+						"route %q: conflicting compress middleware settings; Envoy's compressor filter is listener-wide so every route referencing compress must agree",
+						name)
+				}
+			case m.GRPCWeb != nil:
+				p.needGRPCWeb = true
+			case m.Errors != nil:
+				p.needCustomResponse = true
+				errorServiceSet[m.Errors.Service] = true
+			}
 			switch {
 			case m.BasicAuth != nil:
 				needBasicAuth = true
@@ -239,7 +274,36 @@ func planSecurity(routes map[string]model.Route) (*securityPlan, error) {
 		}
 	}
 
+	if len(errorServiceSet) > 0 {
+		p.errorServiceNames = make([]string, 0, len(errorServiceSet))
+		for svc := range errorServiceSet {
+			p.errorServiceNames = append(p.errorServiceNames, svc)
+		}
+		sort.Strings(p.errorServiceNames)
+	}
+
 	return p, nil
+}
+
+// compressConfigsEqual reports whether two compress middleware configs
+// produce identical listener-wide compressor filter configuration.
+func compressConfigsEqual(a, b *model.CompressMiddleware) bool {
+	if a.MinResponseBytes != b.MinResponseBytes || a.DisableOnETagHeader != b.DisableOnETagHeader {
+		return false
+	}
+	if len(a.ContentTypes) != len(b.ContentTypes) {
+		return false
+	}
+	at := append([]string(nil), a.ContentTypes...)
+	bt := append([]string(nil), b.ContentTypes...)
+	sort.Strings(at)
+	sort.Strings(bt)
+	for i := range at {
+		if at[i] != bt[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // authService records the original address and TLS settings for a forwardauth
@@ -280,6 +344,8 @@ func applyRouteSecurity(er *routev3.Route, chain []model.Middleware) {
 			perRoute[rbacFilterName] = mustAny(ipRBACPerRoute(m.IPDenyList.SourceRange, m.IPDenyList.Strategy, false))
 		case m.RateLimit != nil:
 			perRoute[localRLFilterName] = mustAny(localRateLimitPerRoute(m.RateLimit))
+		case m.Errors != nil:
+			perRoute[customResponseFilterName] = mustAny(customResponsePerRoute(m.Errors))
 		}
 	}
 	if len(perRoute) == 0 {
