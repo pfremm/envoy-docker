@@ -152,6 +152,19 @@ type parsedRouter struct {
 	idleTimeout *time.Duration
 	retry       *model.RetryPolicy
 	middlewares []string
+	// entrypoints is the .entrypoints label: the HTTP entrypoint names this
+	// router is served on. Empty means the default HTTP/HTTPS entrypoints.
+	entrypoints []string
+	// tracing carries the .tracing / .tracing.operationname hooks. tracingSet
+	// records whether the .tracing hook was present (so false is distinct
+	// from unset); operationName is the .tracing.operationname span name.
+	tracingSet    bool
+	tracing       bool
+	operationName string
+	// accesslogSet records whether the .accesslog hook was present; accesslog
+	// is its value.
+	accesslogSet bool
+	accesslog    bool
 }
 
 // parseRouters extracts envoy.http.routers.<name>.{subdomain,port,network,
@@ -267,6 +280,43 @@ func parseRouters(labels map[string]string) (map[string]parsedRouter, map[string
 			}
 			r.priority = p
 			r.prioritySet = true
+		case "entrypoints":
+			eps, err := splitEscapedList(key, value)
+			if err != nil {
+				badRouters[name] = err
+				continue
+			}
+			for _, ep := range eps {
+				if ep == "" {
+					badRouters[name] = fmt.Errorf("router %q: entrypoints list contains an empty entrypoint name", name)
+					break
+				}
+			}
+			if badRouters[name] == nil {
+				r.entrypoints = eps
+			}
+		case "tracing":
+			b, err := parseBoolLabel(key, value)
+			if err != nil {
+				badRouters[name] = err
+				continue
+			}
+			r.tracingSet = true
+			r.tracing = b
+		case "tracing.operationname":
+			if strings.TrimSpace(value) == "" {
+				badRouters[name] = fmt.Errorf("router %q: tracing.operationname cannot be empty", name)
+				continue
+			}
+			r.operationName = value
+		case "accesslog":
+			b, err := parseBoolLabel(key, value)
+			if err != nil {
+				badRouters[name] = err
+				continue
+			}
+			r.accesslogSet = true
+			r.accesslog = b
 		default:
 			continue
 		}

@@ -384,6 +384,17 @@ func applySecurityDefaults(rc *routev3.RouteConfiguration, plan *securityPlan) {
 	}
 }
 
+// applySecurityDefaultsToAll applies the listener-wide security defaults to
+// every route configuration in the snapshot. A router served on several
+// entrypoints appears in several route configs, so each must carry the same
+// per-route defaults (notably the ext_authz disabled override for routes that
+// do not reference a forwardauth middleware).
+func applySecurityDefaultsToAll(rcs []*routev3.RouteConfiguration, plan *securityPlan) {
+	for _, rc := range rcs {
+		applySecurityDefaults(rc, plan)
+	}
+}
+
 // basicAuthPerRoute builds the per-route BasicAuthPerRoute carrying the user
 // list as an inline htpasswd-format DataSource.
 func basicAuthPerRoute(ba *model.BasicAuthMiddleware) *basicauthv3.BasicAuthPerRoute {

@@ -65,6 +65,21 @@ type Config struct {
 	// TCP_DEFAULT_ENTRYPOINT environment variable. Empty means a TCP
 	// router must set .entrypoints explicitly (no implicit default).
 	DefaultTCPEntrypoint string
+
+	// HTTPEntrypoints maps a statically configured HTTP entrypoint name to
+	// the port its listener binds, from the HTTP_ENTRYPOINTS environment
+	// variable (format "name=port,name2=port2"). Entrypoint addresses/ports
+	// are daemon (operator) configuration: a container label can only select
+	// among these names via envoy.http.routers.<r>.entrypoints, never bind a
+	// new host socket of its own. The default HTTP/HTTPS entrypoints
+	// (HTTP_PORT/HTTPS_PORT) always exist and are the fallback for legacy
+	// routers that set no .entrypoints label.
+	HTTPEntrypoints map[string]uint32
+	// DefaultHTTPEntrypoint is the entrypoint name an HTTP router with no
+	// explicit .entrypoints label is served on, from the
+	// HTTP_DEFAULT_ENTRYPOINT environment variable. Empty means the router
+	// is served on the default HTTP/HTTPS entrypoints (legacy behavior).
+	DefaultHTTPEntrypoint string
 }
 
 func Load() (Config, error) {
@@ -136,7 +151,55 @@ func Load() (Config, error) {
 		}
 	}
 
+	cfg.HTTPEntrypoints, err = parseHTTPEntrypoints(os.Getenv("HTTP_ENTRYPOINTS"), cfg.HTTPPort, cfg.HTTPSPort)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DefaultHTTPEntrypoint = os.Getenv("HTTP_DEFAULT_ENTRYPOINT")
+	if cfg.DefaultHTTPEntrypoint != "" {
+		if _, ok := cfg.HTTPEntrypoints[cfg.DefaultHTTPEntrypoint]; !ok {
+			return Config{}, fmt.Errorf("HTTP_DEFAULT_ENTRYPOINT %q is not one of the configured HTTP_ENTRYPOINTS", cfg.DefaultHTTPEntrypoint)
+		}
+	}
+
 	return cfg, nil
+}
+
+// parseHTTPEntrypoints parses the HTTP_ENTRYPOINTS environment variable
+// ("name=port,name2=port2") into a name -> port map. An empty string returns
+// an empty (non-nil) map: extra HTTP entrypoints are simply unconfigured.
+// A port that collides with the default HTTP_PORT or HTTPS_PORT is rejected:
+// the default entrypoints already bind those ports, and a second listener on
+// the same port would be a duplicate Envoy listener.
+func parseHTTPEntrypoints(v string, httpPort, httpsPort uint32) (map[string]uint32, error) {
+	out := map[string]uint32{}
+	if v == "" {
+		return out, nil
+	}
+	for _, entry := range strings.Split(v, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, portStr, ok := strings.Cut(entry, "=")
+		name = strings.TrimSpace(name)
+		portStr = strings.TrimSpace(portStr)
+		if !ok || name == "" || portStr == "" {
+			return nil, fmt.Errorf("HTTP_ENTRYPOINTS entry %q must be name=port", entry)
+		}
+		port, err := strconv.ParseUint(portStr, 10, 16)
+		if err != nil || port == 0 {
+			return nil, fmt.Errorf("HTTP_ENTRYPOINTS entry %q: invalid port %q", entry, portStr)
+		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("HTTP_ENTRYPOINTS defines entrypoint %q more than once", name)
+		}
+		if uint32(port) == httpPort || uint32(port) == httpsPort {
+			return nil, fmt.Errorf("HTTP_ENTRYPOINTS entry %q port %q collides with the default HTTP/HTTPS listener port", entry, portStr)
+		}
+		out[name] = uint32(port)
+	}
+	return out, nil
 }
 
 // parseTCPEntrypoints parses the TCP_ENTRYPOINTS environment variable

@@ -112,8 +112,42 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 		return nil, err
 	}
 
-	routeConfig := buildHTTPSRouteConfiguration(httpCfg.Routes, sortedSubdomains(httpCfg.Routes), cfg.BaseDomain, nil)
-	published := publishedRoutes(httpCfg.Routes, routeConfig)
+	// Group the routes by HTTP entrypoint. The default entrypoint (the legacy
+	// HTTP/HTTPS pair) always exists and carries every router that sets no
+	// .entrypoints label (or the configured default); each configured extra
+	// entrypoint carries only the routers that explicitly select it. A router
+	// selecting an entrypoint the daemon did not configure is rejected:
+	// entrypoint addresses/ports are operator configuration, so a label can
+	// only SELECT among them, never conjure a new bound socket.
+	byEntrypoint, entrypointNames, err := groupRoutesByEntrypoint(httpCfg.Routes, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// One RDS route configuration per entrypoint. The default entrypoint keeps
+	// the legacy resource name (https_routes); extra entrypoints get a
+	// namespaced name (https_routes__<entrypoint>).
+	routeConfigs := make([]*routev3.RouteConfiguration, 0, len(entrypointNames))
+	for _, ep := range entrypointNames {
+		epRoutes := byEntrypoint[ep]
+		name := httpsRouteConfigName
+		if ep != defaultEntrypointName {
+			name = httpsRouteConfigName + "__" + ep
+		}
+		rc := buildHTTPSRouteConfiguration(epRoutes, sortedSubdomains(epRoutes), cfg.BaseDomain, nil)
+		rc.Name = name
+		routeConfigs = append(routeConfigs, rc)
+	}
+
+	// The published set is the union across every entrypoint's route config:
+	// a route is published (and gets a cluster/endpoint) if it is served on
+	// any entrypoint.
+	published := make(map[string]model.Route)
+	for _, rc := range routeConfigs {
+		for subdomain, route := range publishedRoutes(httpCfg.Routes, rc) {
+			published[subdomain] = route
+		}
+	}
 	plan, err := planSecurity(published)
 	if err != nil {
 		return nil, fmt.Errorf("planning security middleware: %w", err)
@@ -230,25 +264,32 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 		}
 		byRouteName[name] = r
 	}
-	for _, vh := range routeConfig.VirtualHosts {
-		for _, er := range vh.Routes {
-			old := er.GetRoute()
-			if old == nil {
-				continue
+	// The per-route middleware/security/observability compilation and the
+	// circuit-breaker/error-service overrides apply to every entrypoint's
+	// route config: a router served on several entrypoints must compile
+	// identically on each.
+	for _, rc := range routeConfigs {
+		for _, vh := range rc.VirtualHosts {
+			for _, er := range vh.Routes {
+				old := er.GetRoute()
+				if old == nil {
+					continue
+				}
+				r, ok := byRouteName[er.Name]
+				if !ok {
+					continue
+				}
+				er.Action = &routev3.Route_Route{Route: configuredRouteAction(r, httpCfg)}
+				if err := applyRouteMiddlewares(er, r.Middlewares); err != nil {
+					return nil, fmt.Errorf("router %q middleware compilation: %w", r.RouterName, err)
+				}
+				applyRouteSecurity(er, r.Middlewares)
+				applyRouteObservability(er, r)
 			}
-			r, ok := byRouteName[er.Name]
-			if !ok {
-				continue
-			}
-			er.Action = &routev3.Route_Route{Route: configuredRouteAction(r, httpCfg)}
-			if err := applyRouteMiddlewares(er, r.Middlewares); err != nil {
-				return nil, fmt.Errorf("router %q middleware compilation: %w", r.RouterName, err)
-			}
-			applyRouteSecurity(er, r.Middlewares)
 		}
-	}
-	if len(cbRouteOverride) > 0 {
-		redirectRouteClusters(routeConfig, cbRouteOverride)
+		if len(cbRouteOverride) > 0 {
+			redirectRouteClusters(rc, cbRouteOverride)
+		}
 	}
 	if len(plan.errorServiceNames) > 0 {
 		errorVHosts := errorServiceVirtualHosts(plan.errorServiceNames, func(name string) (string, bool) {
@@ -257,9 +298,11 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 			}
 			return model.NamedServiceClusterName(name), true
 		})
-		routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, errorVHosts...)
+		for _, rc := range routeConfigs {
+			rc.VirtualHosts = append(rc.VirtualHosts, errorVHosts...)
+		}
 	}
-	applySecurityDefaults(routeConfig, plan)
+	applySecurityDefaultsToAll(routeConfigs, plan)
 
 	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg)
 	if err != nil {
@@ -275,13 +318,37 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 	clusterResources = append(clusterResources, tcpClusters...)
 	endpointResources = append(endpointResources, tcpEndpoints...)
 
-	listeners := []cachetypes.Resource{buildHTTPListener(cfg.HTTPPort), buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName, plan)}
+	// The default entrypoint's listeners are the legacy http_listener (plain
+	// HTTP -> HTTPS redirect) and https_listener (TLS, RDS). Each extra
+	// entrypoint gets its own TLS listener on its configured port, serving
+	// its own RDS route config.
+	listeners := []cachetypes.Resource{
+		buildHTTPListener(cfg.HTTPPort),
+		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan),
+	}
+	for _, ep := range entrypointNames {
+		if ep == defaultEntrypointName {
+			continue
+		}
+		port, ok := cfg.HTTPEntrypoints[ep]
+		if !ok {
+			return nil, fmt.Errorf("internal error: entrypoint %q has no configured port", ep)
+		}
+		listeners = append(listeners, buildHTTPSListener(
+			httpsListenerName+"__"+ep, port, httpsRouteConfigName+"__"+ep,
+			cfg.CertSecretName, cfg.ACMESDSClusterName, plan))
+	}
 	listeners = append(listeners, tcpListeners...)
+
+	routeConfigResources := make([]cachetypes.Resource, 0, len(routeConfigs))
+	for _, rc := range routeConfigs {
+		routeConfigResources = append(routeConfigResources, rc)
+	}
 
 	resources := map[resourcev3.Type][]cachetypes.Resource{
 		resourcev3.ClusterType:  clusterResources,
 		resourcev3.EndpointType: endpointResources,
-		resourcev3.RouteType:    {routeConfig},
+		resourcev3.RouteType:    routeConfigResources,
 		resourcev3.ListenerType: listeners,
 	}
 	snap, err := cachev3.NewSnapshot(version, resources)
