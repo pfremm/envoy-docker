@@ -239,12 +239,15 @@ func parseServices(labels map[string]string) (map[string]serviceDraft, map[strin
 	return drafts, bad, nil
 }
 
-func (w *Watcher) scan(ctx context.Context) (model.HTTPConfiguration, error) {
+func (w *Watcher) scan(ctx context.Context) (model.Configuration, error) {
 	containers, err := w.cli.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
-		return model.HTTPConfiguration{}, fmt.Errorf("listing containers: %w", err)
+		return model.Configuration{}, fmt.Errorf("listing containers: %w", err)
 	}
-	return discover(containers, w.defaultNetwork, w.logger), nil
+	return model.Configuration{
+		HTTP: discover(containers, w.defaultNetwork, w.logger),
+		TCP:  discoverTCP(containers, w.defaultNetwork, w.logger),
+	}, nil
 }
 
 func discover(containers []container.Summary, defaultNetwork string, logger *slog.Logger) model.HTTPConfiguration {

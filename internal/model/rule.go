@@ -1,6 +1,9 @@
 package model
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Rule is a parsed, normalized HTTP routing rule: a boolean expression over
 // matcher atoms (Host, Path, PathPrefix, Headers, Method, Query, ClientIP).
@@ -63,6 +66,9 @@ const (
 	KindQuery
 	// KindClientIP matches the client source IP against a CIDR.
 	KindClientIP
+	// KindSNI matches the TLS SNI server name (case-insensitive). Value "*"
+	// is the catch-all (any SNI, including absent). Used by TCP routers.
+	KindSNI
 )
 
 // Atom is a single matcher leaf in a rule expression.
@@ -115,6 +121,12 @@ func NewQuery(name, value string) Atom {
 // NewClientIP builds a ClientIP(...) atom; value must be a CIDR.
 func NewClientIP(cidr string) Atom {
 	return Atom{Kind: KindClientIP, Value: cidr}
+}
+
+// NewSNI builds a HostSNI(...) atom. The value is normalized to lowercase
+// (SNI matching is case-insensitive); "*" is the catch-all.
+func NewSNI(sni string) Atom {
+	return Atom{Kind: KindSNI, Value: strings.ToLower(sni)}
 }
 
 // And joins two nodes with logical AND.
@@ -181,6 +193,8 @@ func (a Atom) String() string {
 		return "Query(" + a.Name + ", " + a.Value + ")"
 	case KindClientIP:
 		return "ClientIP(" + a.Value + ")"
+	case KindSNI:
+		return "HostSNI(" + a.Value + ")"
 	default:
 		return "<unknown>"
 	}
@@ -263,6 +277,8 @@ func (k AtomKind) Name() string {
 		return "Query"
 	case KindClientIP:
 		return "ClientIP"
+	case KindSNI:
+		return "HostSNI"
 	default:
 		return "unknown"
 	}

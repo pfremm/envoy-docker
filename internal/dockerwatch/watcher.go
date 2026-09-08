@@ -56,7 +56,7 @@ func (w *Watcher) Close() error {
 // on updates whenever it changes: once at startup, on every container
 // lifecycle event, and periodically as a fallback in case an event is
 // missed. It blocks until ctx is cancelled, closing updates on return.
-func (w *Watcher) Run(ctx context.Context, updates chan<- model.HTTPConfiguration) error {
+func (w *Watcher) Run(ctx context.Context, updates chan<- model.Configuration) error {
 	defer close(updates)
 
 	resync := func() bool {

@@ -20,6 +20,15 @@ import (
 )
 
 func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg Config) (cachev3.ResourceSnapshot, error) {
+	return BuildSnapshotForConfigWithTCP(version, httpCfg, model.TCPConfiguration{}, cfg)
+}
+
+// BuildSnapshotForConfigWithTCP extends BuildSnapshotForConfig with TCP
+// routers/services. TCP resources never interact with the HTTP path: they
+// contribute their own listeners (one per configured entrypoint carrying a
+// TCP router) and their own clusters/endpoints, and are validated and built
+// entirely independently of httpCfg.
+func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfiguration, tcpCfg model.TCPConfiguration, cfg Config) (cachev3.ResourceSnapshot, error) {
 	if httpCfg.Routes == nil {
 		httpCfg.Routes = map[string]model.Route{}
 	}
@@ -252,11 +261,28 @@ func BuildSnapshotForConfig(version string, httpCfg model.HTTPConfiguration, cfg
 	}
 	applySecurityDefaults(routeConfig, plan)
 
+	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("building tcp resources: %w", err)
+	}
+	for _, c := range tcpClusters {
+		name := c.(*clusterv3.Cluster).Name
+		if prior, exists := clusterNames[name]; exists {
+			return nil, fmt.Errorf("xDS cluster name %q collides between %s and a tcp resource", name, prior)
+		}
+		clusterNames[name] = "tcp resource"
+	}
+	clusterResources = append(clusterResources, tcpClusters...)
+	endpointResources = append(endpointResources, tcpEndpoints...)
+
+	listeners := []cachetypes.Resource{buildHTTPListener(cfg.HTTPPort), buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName, plan)}
+	listeners = append(listeners, tcpListeners...)
+
 	resources := map[resourcev3.Type][]cachetypes.Resource{
 		resourcev3.ClusterType:  clusterResources,
 		resourcev3.EndpointType: endpointResources,
 		resourcev3.RouteType:    {routeConfig},
-		resourcev3.ListenerType: {buildHTTPListener(cfg.HTTPPort), buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName, plan)},
+		resourcev3.ListenerType: listeners,
 	}
 	snap, err := cachev3.NewSnapshot(version, resources)
 	if err != nil {
