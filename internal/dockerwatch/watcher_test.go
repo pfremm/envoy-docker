@@ -220,6 +220,91 @@ func TestParseRouters_InvalidPriority(t *testing.T) {
 	}
 }
 
+func TestParseRouters_EntrypointsAndObservability(t *testing.T) {
+	got, bad, err := parseRouters(map[string]string{
+		"envoy.enable":                                 "true",
+		"envoy.http.routers.web.subdomain":             "myapp",
+		"envoy.http.routers.web.port":                  "8080",
+		"envoy.http.routers.web.entrypoints":           "http,admin",
+		"envoy.http.routers.web.tracing":               "true",
+		"envoy.http.routers.web.tracing.operationname": "web-span",
+		"envoy.http.routers.web.accesslog":             "true",
+	})
+	if err != nil {
+		t.Fatalf("parseRouters() unexpected error: %v", err)
+	}
+	if len(bad) != 0 {
+		t.Fatalf("parseRouters() badRouters = %v, want none", bad)
+	}
+	r := got["web"]
+	if len(r.entrypoints) != 2 || r.entrypoints[0] != "http" || r.entrypoints[1] != "admin" {
+		t.Errorf("entrypoints = %v, want [http admin]", r.entrypoints)
+	}
+	if !r.tracingSet || !r.tracing {
+		t.Errorf("tracing = %v (set=%v), want true (set=true)", r.tracing, r.tracingSet)
+	}
+	if r.operationName != "web-span" {
+		t.Errorf("operationName = %q, want web-span", r.operationName)
+	}
+	if !r.accesslogSet || !r.accesslog {
+		t.Errorf("accesslog = %v (set=%v), want true (set=true)", r.accesslog, r.accesslogSet)
+	}
+}
+
+func TestParseRouters_TracingFalseDistinctFromUnset(t *testing.T) {
+	got, _, err := parseRouters(map[string]string{
+		"envoy.http.routers.web.subdomain": "myapp",
+		"envoy.http.routers.web.port":      "8080",
+		"envoy.http.routers.web.tracing":   "false",
+	})
+	if err != nil {
+		t.Fatalf("parseRouters() unexpected error: %v", err)
+	}
+	r := got["web"]
+	if !r.tracingSet {
+		t.Errorf("tracingSet = false, want true (.tracing=false is an explicit hook)")
+	}
+	if r.tracing {
+		t.Errorf("tracing = true, want false")
+	}
+	if r.operationName != "" {
+		t.Errorf("operationName = %q, want empty (no operationname label)", r.operationName)
+	}
+}
+
+func TestParseRouters_ObservabilityInvalidIsolated(t *testing.T) {
+	// An invalid .tracing bool rejects only that router; the sibling is
+	// unaffected. An empty entrypoints entry and an empty operationname are
+	// also rejected individually.
+	got, bad, err := parseRouters(map[string]string{
+		"envoy.http.routers.bad.subdomain":              "badsite",
+		"envoy.http.routers.bad.port":                   "8080",
+		"envoy.http.routers.bad.tracing":                "maybe",
+		"envoy.http.routers.bad2.subdomain":             "bad2",
+		"envoy.http.routers.bad2.port":                  "8081",
+		"envoy.http.routers.bad2.entrypoints":           "http,,admin",
+		"envoy.http.routers.bad3.subdomain":             "bad3",
+		"envoy.http.routers.bad3.port":                  "8082",
+		"envoy.http.routers.bad3.tracing.operationname": "",
+		"envoy.http.routers.ok.subdomain":               "fine",
+		"envoy.http.routers.ok.port":                    "8083",
+	})
+	if err != nil {
+		t.Fatalf("parseRouters() unexpected error: %v", err)
+	}
+	for _, name := range []string{"bad", "bad2", "bad3"} {
+		if _, ok := bad[name]; !ok {
+			t.Errorf("expected router %q in badRouters, got %v", name, bad)
+		}
+		if _, ok := got[name]; ok {
+			t.Errorf("router %q should be rejected, got %v", name, got)
+		}
+	}
+	if _, ok := got["ok"]; !ok {
+		t.Errorf("sibling router %q should still be parsed, got %v", "ok", got)
+	}
+}
+
 func TestMergeDecision(t *testing.T) {
 	// No existing route: add.
 	if a, _ := mergeDecision(model.Route{}, false, "Host(a)", "o1"); a != mergeAdd {

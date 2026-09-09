@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -418,5 +419,249 @@ func TestBuildRouteConfig_UntranslatableRuleSkippedOnly(t *testing.T) {
 	}
 	if !bytes.Contains(logs.Bytes(), []byte("ClientIP")) {
 		t.Errorf("expected an actionable warning mentioning ClientIP, got: %s", logs.String())
+	}
+}
+
+func TestGroupRoutesByEntrypoint_DefaultAndExplicit(t *testing.T) {
+	cfg := Config{
+		HTTPEntrypoints: map[string]uint32{"admin": 8443},
+	}
+	routes := map[string]model.Route{
+		// No .entrypoints label -> default entrypoint (legacy pair).
+		"legacy": {Subdomain: "legacy", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}},
+		// Explicit admin entrypoint.
+		"admin": {Subdomain: "admin", Endpoints: []model.Endpoint{{Address: "10.0.0.2", Port: 8080}}, Entrypoints: []string{"admin"}},
+		// Served on both the default and admin entrypoints.
+		"both": {Subdomain: "both", Endpoints: []model.Endpoint{{Address: "10.0.0.3", Port: 8080}}, Entrypoints: []string{"default", "admin"}},
+	}
+	byEp, names, err := groupRoutesByEntrypoint(routes, cfg)
+	if err != nil {
+		t.Fatalf("groupRoutesByEntrypoint() unexpected error: %v", err)
+	}
+	wantNames := []string{"admin", "default"}
+	if len(names) != 2 || names[0] != wantNames[0] || names[1] != wantNames[1] {
+		t.Fatalf("entrypointNames = %v, want %v (sorted, always includes default)", names, wantNames)
+	}
+	// The default entrypoint carries the legacy route and the "both" route.
+	if got := len(byEp["default"]); got != 2 {
+		t.Errorf("default entrypoint carries %d routes, want 2 (legacy, both): %+v", got, byEp["default"])
+	}
+	if _, ok := byEp["default"]["legacy"]; !ok {
+		t.Errorf("default entrypoint should carry the legacy route, got %+v", byEp["default"])
+	}
+	// The admin entrypoint carries the admin route and the "both" route.
+	if got := len(byEp["admin"]); got != 2 {
+		t.Errorf("admin entrypoint carries %d routes, want 2 (admin, both): %+v", got, byEp["admin"])
+	}
+	if _, ok := byEp["admin"]["admin"]; !ok {
+		t.Errorf("admin entrypoint should carry the admin route, got %+v", byEp["admin"])
+	}
+}
+
+func TestGroupRoutesByEntrypoint_UnknownEntryptRejected(t *testing.T) {
+	cfg := Config{HTTPEntrypoints: map[string]uint32{"admin": 8443}}
+	routes := map[string]model.Route{
+		"bad": {Subdomain: "bad", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}, Entrypoints: []string{"ghost"}},
+	}
+	_, _, err := groupRoutesByEntrypoint(routes, cfg)
+	if err == nil {
+		t.Fatal("groupRoutesByEntrypoint() expected an error for an unknown entrypoint, got nil")
+	}
+	if !strings.Contains(err.Error(), "ghost") {
+		t.Errorf("error = %q, want it to name the unknown entrypoint %q", err.Error(), "ghost")
+	}
+}
+
+func TestGroupRoutesByEntrypoint_ConfiguredDefault(t *testing.T) {
+	// With a configured default entrypoint, a router with no .entrypoints
+	// label is served on that entrypoint (not the implicit default pair).
+	cfg := Config{
+		HTTPEntrypoints:       map[string]uint32{"admin": 8443},
+		DefaultHTTPEntrypoint: "admin",
+	}
+	routes := map[string]model.Route{
+		"legacy": {Subdomain: "legacy", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}},
+	}
+	byEp, names, err := groupRoutesByEntrypoint(routes, cfg)
+	if err != nil {
+		t.Fatalf("groupRoutesByEntrypoint() unexpected error: %v", err)
+	}
+	if len(names) != 1 || names[0] != "admin" {
+		t.Fatalf("entrypointNames = %v, want [admin] (configured default)", names)
+	}
+	if _, ok := byEp["admin"]["legacy"]; !ok {
+		t.Errorf("legacy route should be on the configured default entrypoint, got %+v", byEp)
+	}
+}
+
+func TestBuildSnapshot_EntrypointListenersAndRouteConfigs(t *testing.T) {
+	routes := map[string]model.Route{
+		"legacy": {Subdomain: "legacy", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}, Source: model.SourceDocker},
+		"admin":  {Subdomain: "admin", Endpoints: []model.Endpoint{{Address: "10.0.0.2", Port: 8080}}, Source: model.SourceDocker, Entrypoints: []string{"admin"}},
+	}
+	cfg := Config{
+		BaseDomain:         "example.com",
+		HTTPPort:           80,
+		HTTPSPort:          443,
+		CertSecretName:     "wildcard-cert",
+		ACMESDSClusterName: "acme_sds_cluster",
+		HTTPEntrypoints:    map[string]uint32{"admin": 8443},
+	}
+	snap, err := BuildSnapshot("1", routes, cfg)
+	if err != nil {
+		t.Fatalf("BuildSnapshot() unexpected error: %v", err)
+	}
+
+	// Two RDS route configs: the legacy https_routes (default) and the
+	// namespaced https_routes__admin.
+	rcs := snap.GetResources(resourcev3.RouteType)
+	if _, ok := rcs[httpsRouteConfigName]; !ok {
+		t.Errorf("expected route config %q, got %v", httpsRouteConfigName, rcs)
+	}
+	if _, ok := rcs[httpsRouteConfigName+"__admin"]; !ok {
+		t.Errorf("expected route config %q, got %v", httpsRouteConfigName+"__admin", rcs)
+	}
+	// The default route config carries only the legacy route's host.
+	defRC := rcs[httpsRouteConfigName].(*routev3.RouteConfiguration)
+	if len(defRC.VirtualHosts) != 1 || defRC.VirtualHosts[0].Domains[0] != "legacy.example.com" {
+		t.Errorf("default route config virtual hosts = %+v, want one for legacy.example.com", defRC.VirtualHosts)
+	}
+	adminRC := rcs[httpsRouteConfigName+"__admin"].(*routev3.RouteConfiguration)
+	if len(adminRC.VirtualHosts) != 1 || adminRC.VirtualHosts[0].Domains[0] != "admin.example.com" {
+		t.Errorf("admin route config virtual hosts = %+v, want one for admin.example.com", adminRC.VirtualHosts)
+	}
+
+	// Three listeners: the legacy http_listener + https_listener, plus a
+	// dedicated TLS listener for the admin entrypoint on its configured port.
+	listeners := snap.GetResources(resourcev3.ListenerType)
+	if _, ok := listeners[httpsListenerName]; !ok {
+		t.Errorf("expected listener %q, got %v", httpsListenerName, listeners)
+	}
+	adminListener, ok := listeners[httpsListenerName+"__admin"]
+	if !ok {
+		t.Fatalf("expected admin entrypoint listener %q, got %v", httpsListenerName+"__admin", listeners)
+	}
+	al := adminListener.(*listenerv3.Listener)
+	if al.Address.GetSocketAddress().GetPortValue() != 8443 {
+		t.Errorf("admin listener port = %d, want 8443", al.Address.GetSocketAddress().GetPortValue())
+	}
+	adminHCM := decodeHCM(t, al)
+	if adminHCM.GetRds().GetRouteConfigName() != httpsRouteConfigName+"__admin" {
+		t.Errorf("admin listener RDS route config name = %q, want %q", adminHCM.GetRds().GetRouteConfigName(), httpsRouteConfigName+"__admin")
+	}
+	// The admin listener is TLS.
+	if al.FilterChains[0].TransportSocket == nil {
+		t.Error("admin entrypoint listener should have a TLS transport socket")
+	}
+
+	// Both routes are published (each gets a cluster + endpoint) even though
+	// they live on different entrypoints.
+	clusters := snap.GetResources(resourcev3.ClusterType)
+	if _, ok := clusters["legacy"]; !ok {
+		t.Errorf("expected cluster %q, got %v", "legacy", clusters)
+	}
+	if _, ok := clusters["admin"]; !ok {
+		t.Errorf("expected cluster %q, got %v", "admin", clusters)
+	}
+}
+
+func TestApplyRouteObservability_TracingAndAccessLog(t *testing.T) {
+	mk := func(sub string, tr *model.TracingConfig, access *bool) model.Route {
+		return model.Route{Subdomain: sub, Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}, RouterName: sub, Tracing: tr, AccessLog: access}
+	}
+
+	// Tracing enabled with an operation name -> per-route Tracing with a
+	// span name and 100% sampling.
+	r := mk("traced", &model.TracingConfig{Enabled: true, OperationName: "my-span"}, nil)
+	er := &routev3.Route{}
+	applyRouteObservability(er, r)
+	if er.Tracing == nil {
+		t.Fatal("expected a per-route Tracing message, got nil")
+	}
+	if er.Tracing.Operation != "my-span" {
+		t.Errorf("Tracing.Operation = %q, want my-span", er.Tracing.Operation)
+	}
+	if er.Tracing.OverallSampling == nil || er.Tracing.OverallSampling.GetNumerator() != 100 {
+		t.Errorf("Tracing.OverallSampling = %+v, want 100/100 (enabled)", er.Tracing.OverallSampling)
+	}
+
+	// Tracing explicitly disabled -> 0% sampling, no span name.
+	r = mk("off", &model.TracingConfig{Enabled: false}, nil)
+	er = &routev3.Route{}
+	applyRouteObservability(er, r)
+	if er.Tracing == nil {
+		t.Fatal("expected a per-route Tracing message (explicit false), got nil")
+	}
+	if er.Tracing.OverallSampling == nil || er.Tracing.OverallSampling.GetNumerator() != 0 {
+		t.Errorf("Tracing.OverallSampling = %+v, want 0/100 (disabled)", er.Tracing.OverallSampling)
+	}
+	if er.Tracing.Operation != "" {
+		t.Errorf("Tracing.Operation = %q, want empty (no operationname)", er.Tracing.Operation)
+	}
+
+	// Access log enabled -> route metadata in the observability namespace.
+	on := true
+	r = mk("logged", nil, &on)
+	er = &routev3.Route{}
+	applyRouteObservability(er, r)
+	md := er.Metadata
+	if md == nil || md.FilterMetadata[observabilityMetadataNamespace] == nil {
+		t.Fatalf("expected route metadata in namespace %q, got %+v", observabilityMetadataNamespace, er.Metadata)
+	}
+	fields := md.FilterMetadata[observabilityMetadataNamespace].GetFields()
+	if got := fields["accesslog"].GetBoolValue(); got != true {
+		t.Errorf("metadata accesslog = %v, want true", got)
+	}
+	if got := fields["subdomain"].GetStringValue(); got != "logged" {
+		t.Errorf("metadata subdomain = %q, want logged", got)
+	}
+	if fields["router"] == nil {
+		t.Error("metadata should carry the router name")
+	}
+
+	// No hooks -> no Tracing message and no metadata.
+	er = &routev3.Route{}
+	applyRouteObservability(er, mk("plain", nil, nil))
+	if er.Tracing != nil {
+		t.Errorf("unexpected Tracing message for a route with no hooks: %+v", er.Tracing)
+	}
+	if er.Metadata != nil {
+		t.Errorf("unexpected metadata for a route with no hooks: %+v", er.Metadata)
+	}
+}
+
+func TestBuildSnapshot_ObservabilityOnEmittedRoutes(t *testing.T) {
+	on := true
+	routes := map[string]model.Route{
+		"traced": {
+			Subdomain:  "traced",
+			Endpoints:  []model.Endpoint{{Address: "10.0.0.1", Port: 8080}},
+			Source:     model.SourceDocker,
+			RouterName: "traced",
+			Tracing:    &model.TracingConfig{Enabled: true, OperationName: "traced-span"},
+			AccessLog:  &on,
+		},
+	}
+	cfg := Config{
+		BaseDomain:         "example.com",
+		HTTPPort:           80,
+		HTTPSPort:          443,
+		CertSecretName:     "cert",
+		ACMESDSClusterName: "acme",
+	}
+	snap, err := BuildSnapshot("1", routes, cfg)
+	if err != nil {
+		t.Fatalf("BuildSnapshot() unexpected error: %v", err)
+	}
+	rc := snap.GetResources(resourcev3.RouteType)[httpsRouteConfigName].(*routev3.RouteConfiguration)
+	if len(rc.VirtualHosts) != 1 || len(rc.VirtualHosts[0].Routes) != 1 {
+		t.Fatalf("expected one virtual host with one route, got %+v", rc.VirtualHosts)
+	}
+	er := rc.VirtualHosts[0].Routes[0]
+	if er.Tracing == nil || er.Tracing.Operation != "traced-span" {
+		t.Errorf("emitted route Tracing = %+v, want operation traced-span", er.Tracing)
+	}
+	if er.Metadata == nil || er.Metadata.FilterMetadata[observabilityMetadataNamespace] == nil {
+		t.Errorf("emitted route should carry observability metadata, got %+v", er.Metadata)
 	}
 }

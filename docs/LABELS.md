@@ -33,6 +33,10 @@ number of routers.
 | `envoy.http.routers.<name>.retries.attempts` | no | Positive retry count. |
 | `envoy.http.routers.<name>.retries.pertrytimeout` | no | Positive timeout for each try. |
 | `envoy.http.routers.<name>.retries.retryon` | no | Envoy retry conditions, for example `5xx,reset,connect-failure`. |
+| `envoy.http.routers.<name>.entrypoints` | no | Comma/escape list of HTTP entrypoint names (daemon-configured, see [HTTP entrypoints](#http-entrypoints)). Omitted means the default HTTP/HTTPS entrypoints (legacy behavior). |
+| `envoy.http.routers.<name>.accesslog` | no | `true`\|`false`. See [Observability hooks](#observability-hooks). |
+| `envoy.http.routers.<name>.tracing` | no | `true`\|`false`. See [Observability hooks](#observability-hooks). |
+| `envoy.http.routers.<name>.tracing.operationname` | no | Per-route span name. See [Observability hooks](#observability-hooks). |
 
 Any other `envoy.http.routers.<name>.*` field is ignored.
 
@@ -432,6 +436,106 @@ routers:
 Each entry requires a `subdomain`, a `port`, and at least one `addresses`
 entry. Duplicate subdomains within the file are an error.
 
+## HTTP entrypoints
+
+`envoy.http.routers.<name>.entrypoints` accepts a comma/escape-separated list
+of HTTP entrypoint names. Like TCP entrypoints, an HTTP entrypoint's name and
+port are pure daemon/operator configuration (`HTTP_ENTRYPOINTS=name=port,...`
+and, optionally, `HTTP_DEFAULT_ENTRYPOINT=name` in the control plane's own
+environment) — a container label can only *select* among entrypoints the
+operator already configured, never bind a new host socket of its own. This is
+the same trust boundary as TCP: untrusted container labels never get to open
+a listener that wasn't already provisioned by whoever runs the control plane.
+
+A router with no `.entrypoints` label is served on `HTTP_DEFAULT_ENTRYPOINT`
+when set, or otherwise on the always-present legacy default entrypoint — the
+`HTTP_PORT`/`HTTPS_PORT` pair every router used before this feature existed.
+That default entrypoint keeps the legacy resource names (`http_listener`,
+`https_listener`, `https_routes`) so upgrading the control plane binary never
+renames or disrupts a router that never asked for a named entrypoint. Each
+extra configured entrypoint gets its own TLS listener (`https_listener__<ep>`)
+on its configured port, serving its own RDS route configuration
+(`https_routes__<ep>`); a router naming multiple entrypoints is published,
+unmodified, on every one of them. A router naming an entrypoint the daemon
+did not configure is rejected with the list of valid names, exactly like the
+TCP case.
+
+Unlike TCP entrypoints (which carry either a raw or TLS-passthrough chain and
+never terminate TLS), every HTTP entrypoint listener — default or named — is
+a TLS-terminating listener sharing the same certificate/SDS configuration;
+there is currently no way to publish a router on a plain-HTTP-only named
+entrypoint (the always-present `HTTP_PORT` listener still exists solely to
+redirect to HTTPS, exactly as before).
+
+```yaml
+labels:
+  envoy.enable: "true"
+  # Legacy router: served on the default HTTP/HTTPS entrypoints, unchanged.
+  envoy.http.routers.web.subdomain: myapp
+  envoy.http.routers.web.port: "8080"
+
+  # Served only on a dedicated "admin" entrypoint, e.g. bound to a private
+  # network interface by the operator's HTTP_ENTRYPOINTS configuration.
+  envoy.http.routers.admin.subdomain: admin
+  envoy.http.routers.admin.port: "9090"
+  envoy.http.routers.admin.entrypoints: admin
+```
+
+With `HTTP_ENTRYPOINTS=admin=8444` in the control plane's environment: `web`
+keeps serving `myapp.example.com` on the default `HTTP_PORT`/`HTTPS_PORT`
+pair exactly as it always did, and `admin` additionally gets its own TLS
+listener on `8444` serving only `admin.example.com`.
+
+## Observability hooks
+
+Three router labels give per-route control over Envoy's tracing and
+access-logging behavior, implemented with the route decorator/metadata and
+per-route tracing-override semantics the pinned Envoy API exposes:
+
+| Label | Meaning |
+| --- | --- |
+| `envoy.http.routers.<name>.tracing` | `true` forces 100% trace sampling for this route's traffic; `false` disables tracing for it (0% sampling), overriding whatever the listener/HCM default would otherwise select. Omitted leaves the route at the listener default. |
+| `envoy.http.routers.<name>.tracing.operationname` | Sets the route's per-route span name (`Route.Tracing.Operation`), which takes precedence over the HCM's default operation name. Can be set with or without `.tracing`; setting it alone does not change the sampling decision. |
+| `envoy.http.routers.<name>.accesslog` | `true`\|`false`. Recorded as route metadata (see below) under the `envoy-control-plane.observability` filter-metadata namespace, alongside the router's name and subdomain, so a log-processing or metrics pipeline consuming that metadata can distinguish routers that opted in from ones that didn't. |
+
+`.tracing`/`.tracing.operationname` are true per-route Envoy semantics
+(`Route.Tracing.overall_sampling` and `Route.Tracing.operation`) and directly
+change whether/how a request is traced. `.accesslog` is different: **Envoy's
+pinned access-log configuration is listener-scoped, not per-route** — there
+is no field on `Route` that turns access logging on or off for just that
+route in the API version this control plane targets. Setting
+`.accesslog=true|false` therefore does not itself enable or suppress a log
+line; it is a declarative carrier of the operator's intent, recorded as route
+metadata that an access-log format string (or an external log-processing
+pipeline reading Envoy's metadata field) can key off. See
+[Limitations](#observability-limitations) for the precise implication.
+
+None of these hooks ever place a secret or raw `Authorization`/credential
+header into generated metadata, tracing spans, or (by extension) whatever
+access-log format an operator layers on top: the emitted metadata carries
+only the boolean flag, the router name, and the subdomain — never request
+headers, path query strings, or middleware-scrubbed credentials. Combine this
+with the BasicAuth/ForwardAuth credential-redaction behavior described above
+if request headers themselves ever need to reach a log or trace pipeline.
+
+### Observability limitations {#observability-limitations}
+
+- `.accesslog` does not, by itself, install or configure an access-log sink
+  (Envoy's `stdout`/`file`/gRPC access loggers) or filter which requests are
+  written to one — that remains an operator concern (the Envoy bootstrap
+  template's listener `access_log` stanza), independent of this control
+  plane's generated resources, because access logging is listener-scoped in
+  the pinned API and this milestone's per-route hook cannot select a
+  listener-level sink per route. `.accesslog=false` is therefore *not* a
+  guarantee that a route's requests are absent from whatever sink the
+  listener does have configured; it only stops that route from carrying the
+  observability metadata an access-log format or downstream consumer would
+  otherwise use to flag it as "opted in".
+- `.tracing`/`.tracing.operationname` require the listener to actually have
+  tracing configured (an HCM `tracing` provider) to have any effect; on a
+  listener with tracing disabled entirely, a per-route override has nothing
+  to override.
+
 ## TCP routers, raw TCP, and TLS passthrough
 
 TCP routing is a separate label namespace (`envoy.tcp.*`) from HTTP. It
@@ -449,7 +553,7 @@ Each router is a group of labels sharing the prefix
 | --- | --- | --- |
 | `envoy.tcp.routers.<name>.rule` | yes | A `HostSNI(...)` rule (below). |
 | `envoy.tcp.routers.<name>.service` | yes | Selects `envoy.tcp.services.<service>`. |
-| `envoy.tcp.routers.<name>.entrypoints` | see below | Comma/escape list of TCP entrypoint names (daemon-configured, see [Entrypoints](#entrypoints)). |
+| `envoy.tcp.routers.<name>.entrypoints` | see below | Comma/escape list of TCP entrypoint names (daemon-configured, see [TCP entrypoints](#tcp-entrypoints)). |
 | `envoy.tcp.routers.<name>.priority` | no | Explicit integer priority; higher wins on overlapping SNI. See [Precedence and conflicts](#tcp-precedence-and-conflicts). |
 | `envoy.tcp.routers.<name>.tls.passthrough` | no (default `false`) | `true` selects TLS passthrough; `false` (default) selects raw TCP. |
 | `envoy.tcp.routers.<name>.network` | no | Docker network override, same semantics as the HTTP router field. |
@@ -499,7 +603,7 @@ every connection outright when used as a raw router (see below).
   a concrete `HostSNI(...)` value is rejected at validation with an
   actionable error.
 
-### Entrypoints
+### TCP entrypoints
 
 `.entrypoints` only ever *selects among* entrypoints the daemon operator
 already configured (via `TCP_ENTRYPOINTS=name=port,name2=port2` and,
@@ -609,3 +713,71 @@ listener with no TLS inspection since it is not TLS passthrough.
   here).
 - `HostSNI` is the only TCP matcher; there is no TCP equivalent of
   `Path`/`Headers`/`Method`/etc., since those are HTTP-layer concepts.
+
+## Migration from legacy `subdomain` labels and Traefik
+
+### From this control plane's own legacy labels
+
+The very first form this control plane supported was a legacy, no-rule
+router: `envoy.http.routers.<name>.subdomain` plus `.port` (or `.service`),
+with no `.rule`. Every feature added since is additive — a legacy router
+keeps working unmodified, with no relabeling required, forever:
+
+```yaml
+# Original legacy router. Still valid on the latest version, unchanged.
+envoy.enable: "true"
+envoy.http.routers.web.subdomain: myapp
+envoy.http.routers.web.port: "8080"
+```
+
+To opt an existing legacy router into a feature added later, add only the
+label(s) for that feature; nothing about `subdomain`/`port` changes:
+
+```yaml
+envoy.enable: "true"
+envoy.http.routers.web.subdomain: myapp
+envoy.http.routers.web.port: "8080"
+# Opt into an operator-configured named entrypoint...
+envoy.http.routers.web.entrypoints: admin
+# ...and observability hooks, without touching the router's core shape.
+envoy.http.routers.web.accesslog: "true"
+envoy.http.routers.web.tracing: "true"
+```
+
+A legacy router that never sets `.rule` continues to behave as a
+`PathPrefix(/)` catch-all for its subdomain; there is no need to write an
+equivalent `.rule` label to preserve behavior.
+
+### Traefik-to-envoy label mapping
+
+This control plane's label grammar deliberately echoes Traefik's Docker
+provider so migrating a compose file is mostly a `traefik.` -> `envoy.`
+prefix swap plus the differences below. It is **not** a drop-in replacement
+of Traefik's label surface — only the mappings in this table (and the
+features documented elsewhere in this file) are supported.
+
+| Traefik label | This control plane | Notes |
+| --- | --- | --- |
+| `traefik.enable=true` | `envoy.enable=true` | Same semantics: opt-in per container. |
+| `traefik.http.routers.<r>.rule=Host(\`app.example.com\`)` | `envoy.http.routers.<r>.rule=Host(app.example.com)` | No backticks around the value; this grammar's `Host(...)` takes a bare hostname. Traefik's `Host()`/`Headers()`/etc. all lower/uppercase quoting rules do not apply here — see [Matchers](#matchers). |
+| `traefik.http.routers.<r>.rule=PathPrefix(\`/api\`)` | `envoy.http.routers.<r>.rule=PathPrefix(/api)` | Same idea; combine with `Host(...)` via `&&` as shown throughout this doc. |
+| `traefik.http.routers.<r>.priority=10` | `envoy.http.routers.<r>.priority=10` | Same integer-priority override semantics; both fall back to rule-specificity ordering when unset. |
+| `traefik.http.routers.<r>.entrypoints=websecure` | `envoy.http.routers.<r>.entrypoints=websecure` | Same idea (comma-separated selection among *daemon-configured* entrypoints), but Traefik entrypoints are typically declared in its static config file, while here they come from `HTTP_ENTRYPOINTS`/`TCP_ENTRYPOINTS` environment variables. See [HTTP entrypoints](#http-entrypoints) / [TCP entrypoints](#tcp-entrypoints). |
+| `traefik.http.routers.<r>.middlewares=strip@docker,cors@docker` | `envoy.http.routers.<r>.middlewares=strip,cors` | No `@docker`/`@file` provider suffix; every middleware referenced by a router must be defined by another label on some container in the same discovery pass. |
+| `traefik.http.routers.<r>.tls=true` (+ `certresolver`) | *(implicit)* | TLS termination and ACME are handled entirely by the separate `envoy-acme` control plane via SDS; there is no per-router TLS/certresolver label here. Every router on a TLS-terminating entrypoint gets the one wildcard cert configured for the whole control plane (`CERT_SECRET_NAME`). |
+| `traefik.http.middlewares.<m>.stripprefix.prefixes=/api` | `envoy.http.middlewares.<m>.stripprefix.prefixes=/api` | Same list syntax (comma-separated, or indexed — see [List syntax](#list-syntax)). |
+| `traefik.http.middlewares.<m>.redirectscheme.scheme=https` | `envoy.http.middlewares.<m>.redirectscheme.scheme=https` | Same fields (`scheme`, `port`, `permanent`). |
+| `traefik.http.middlewares.<m>.basicauth.users=user:hash` | `envoy.http.middlewares.<m>.basicauth.users=user:{SHA}hash` | Envoy's native `basic_auth` filter only accepts Apache htpasswd `{SHA}` entries in this milestone; Traefik's bcrypt (`$apr1$`/`$2y$`) hashes are **not** accepted and must be regenerated. See [Security middleware](#security-middleware). |
+| `traefik.http.middlewares.<m>.forwardauth.address=...` | `envoy.http.middlewares.<m>.forwardauth.address=...` | Same idea (fail-closed external auth check); field names differ slightly (`trustforwardheader`, `authresponseheaders`, etc.) — see [Security middleware](#security-middleware) for the full set. |
+| `traefik.http.middlewares.<m>.ratelimit.average=10` | `envoy.http.middlewares.<m>.ratelimit.average=10` | Same `average`/`burst`/`period` shape, but this is a **local, per-Envoy-process** token bucket, not Traefik's (also local-by-default) limiter — see the rate-limiting note under [Security middleware](#security-middleware) for the N-replica caveat. There is no global/distributed rate limiter in this milestone. |
+| `traefik.http.services.<s>.loadbalancer.server.port=8080` | `envoy.http.services.<s>.loadbalancer.servers.0.port=8080` | Named services here always use the indexed `servers.<n>.port` form (supporting multiple backends/replicas per service), where Traefik's Docker provider infers one port automatically per container. |
+| `traefik.tcp.routers.<r>.rule=HostSNI(\`db.example.com\`)` | `envoy.tcp.routers.<r>.rule=HostSNI(db.example.com)` | Same idea, no backticks. See [TCP routers](#tcp-routers-raw-tcp-and-tls-passthrough). |
+| `traefik.tcp.routers.<r>.tls.passthrough=true` | `envoy.tcp.routers.<r>.tls.passthrough=true` | Same semantics. |
+
+Traefik features with **no equivalent** in this control plane (do not expect
+these labels to do anything if carried over verbatim): dynamic file/etcd/consul
+providers, the dashboard/API, `traefik.http.routers.<r>.tls.domains.*` (SAN
+management — handled entirely by the external `envoy-acme` service here),
+per-router TLS options (`tls.options`), Traefik plugins, and any middleware
+family not listed in [HTTP middleware](#http-middleware) (e.g. Traefik's
+`chain`, `plugin`, `digestauth`, or `inflightreq` have no port here).

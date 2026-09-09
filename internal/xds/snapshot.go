@@ -339,6 +339,12 @@ func groupRoutesByEntrypoint(routes map[string]model.Route, cfg Config) (map[str
 	}
 	names := make([]string, 0, len(byEntrypoint))
 	for ep := range byEntrypoint {
+		if len(byEntrypoint[ep]) == 0 {
+			// The default entrypoint is always present in the map (so a
+			// router can explicitly select it), but it only earns a route
+			// config and listener when a route is actually served on it.
+			continue
+		}
 		names = append(names, ep)
 	}
 	sort.Strings(names)
