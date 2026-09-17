@@ -184,6 +184,9 @@ func Load() (Config, error) {
 }
 
 func validateSharedEntrypointPorts(httpPort, httpsPort uint32, http, tcp map[string]uint32) error {
+	if httpPort == httpsPort {
+		return fmt.Errorf("default HTTP and HTTPS listeners both use port %d", httpPort)
+	}
 	used := map[uint32]string{httpPort: "default HTTP", httpsPort: "default HTTPS"}
 	for name, port := range http {
 		if prior, ok := used[port]; ok {
