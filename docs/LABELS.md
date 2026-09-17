@@ -431,3 +431,181 @@ routers:
 
 Each entry requires a `subdomain`, a `port`, and at least one `addresses`
 entry. Duplicate subdomains within the file are an error.
+
+## TCP routers, raw TCP, and TLS passthrough
+
+TCP routing is a separate label namespace (`envoy.tcp.*`) from HTTP. It
+never attaches an HTTP connection manager: a TCP filter chain always carries
+exactly a `tcp_proxy` network filter, optionally gated by Envoy's TLS
+inspector for passthrough. No TCP middlewares are supported in this
+milestone.
+
+### Per-router fields
+
+Each router is a group of labels sharing the prefix
+`envoy.tcp.routers.<name>.`, mirroring the HTTP router shape:
+
+| Label | Required | Meaning |
+| --- | --- | --- |
+| `envoy.tcp.routers.<name>.rule` | yes | A `HostSNI(...)` rule (below). |
+| `envoy.tcp.routers.<name>.service` | yes | Selects `envoy.tcp.services.<service>`. |
+| `envoy.tcp.routers.<name>.entrypoints` | see below | Comma/escape list of TCP entrypoint names (daemon-configured, see [Entrypoints](#entrypoints)). |
+| `envoy.tcp.routers.<name>.priority` | no | Explicit integer priority; higher wins on overlapping SNI. See [Precedence and conflicts](#tcp-precedence-and-conflicts). |
+| `envoy.tcp.routers.<name>.tls.passthrough` | no (default `false`) | `true` selects TLS passthrough; `false` (default) selects raw TCP. |
+| `envoy.tcp.routers.<name>.network` | no | Docker network override, same semantics as the HTTP router field. |
+
+### The SNI rule DSL
+
+```
+expr    := term ( '||' term )*
+term    := factor ( '&&' factor )*
+factor  := '!' factor | '(' expr ')' | matcher
+matcher := HostSNI
+```
+
+`HostSNI(value, ...)` is the only matcher; multiple values are ORed. The
+grammar accepts `&&`, `||`, `!`, and parentheses like the HTTP rule DSL, but
+only a rule that reduces to a pure disjunction of (non-negated) `HostSNI`
+atoms is actually usable — Envoy's filter-chain `server_names` matching has
+no negation and no cross-dimension conjunction, so:
+
+- `!HostSNI(...)` (negation anywhere in the rule) is rejected.
+- Any matcher other than `HostSNI` (there are none defined for TCP, but the
+  grammar would otherwise accept it) is rejected.
+- `HostSNI(a) && HostSNI(b)` for distinct `a`/`b` is a contradiction (no
+  request can present two different SNI values at once) and is rejected as
+  unsatisfiable, the same way the HTTP DNF expander rejects
+  `Path(/a) && Path(/b)`.
+
+`HostSNI(*)` is the catch-all: it matches any SNI value, including a
+connection with no SNI at all when used as a passthrough router, or matches
+every connection outright when used as a raw router (see below).
+
+### Raw TCP vs. TLS passthrough
+
+- **TLS passthrough** (`tls.passthrough=true`) forwards the encrypted TLS
+  bytes untouched: Envoy never terminates TLS on this chain (no downstream
+  `TransportSocket`). The generated filter chain matches
+  `transport_protocol=tls` plus, for a non-catch-all rule, `server_names`
+  from the rule's `HostSNI(...)` values. This requires the listener's TLS
+  inspector (added automatically whenever any passthrough router exists on
+  that entrypoint) to have peeked the ClientHello's SNI first.
+- **Raw TCP** (`tls.passthrough=false`, the default) has no TLS
+  inspection requirement and matches `transport_protocol=raw_buffer`.
+  Because there is no ClientHello to inspect, a raw router's rule **must**
+  be exactly `HostSNI(*)` (the catch-all) — matching on a concrete SNI value
+  is only meaningful once the bytes have been proven to be a TLS
+  ClientHello, which raw TCP explicitly does not require. A raw router with
+  a concrete `HostSNI(...)` value is rejected at validation with an
+  actionable error.
+
+### Entrypoints
+
+`.entrypoints` only ever *selects among* entrypoints the daemon operator
+already configured (via `TCP_ENTRYPOINTS=name=port,name2=port2` and,
+optionally, `TCP_DEFAULT_ENTRYPOINT=name` in the control plane's own
+environment); a container label can never bind a new host socket of its
+own. A router with no `.entrypoints` label uses `TCP_DEFAULT_ENTRYPOINT`
+when set; otherwise it is rejected (an explicit entrypoint is required). A
+router naming an entrypoint that was not configured is rejected with the
+list of valid names. Comma-separated multiple entrypoints publish the same
+router's filter chain on every named listener. Existing HTTP/HTTPS
+entrypoints (`HTTP_PORT`/`HTTPS_PORT`) are untouched by any of this and
+keep serving legacy HTTP routers exactly as before.
+
+### TCP named services
+
+```yaml
+labels:
+  envoy.enable: "true"
+  envoy.tcp.routers.postgres.rule: "HostSNI(*)"
+  envoy.tcp.routers.postgres.service: db
+  envoy.tcp.services.db.loadbalancer.servers.0.port: "5432"
+  envoy.tcp.services.db.loadbalancer.servers.1.port: "5433"
+```
+
+A plain named multi-endpoint service (indexed `loadbalancer.servers.<n>.port`)
+is the mandatory form; replica containers with the same compatible service
+definition contribute additional endpoints exactly like HTTP named
+services. Weighted TCP services mirror the HTTP naming:
+
+```yaml
+envoy.tcp.services.rollout.weighted.services.0.name: blue
+envoy.tcp.services.rollout.weighted.services.0.weight: "90"
+envoy.tcp.services.rollout.weighted.services.1.name: canary
+envoy.tcp.services.rollout.weighted.services.1.weight: "10"
+```
+
+A service cannot combine direct servers and weighted children in the same
+definition; unknown, invalid, or cyclic services invalidate only the
+routers that reference them.
+
+### TCP precedence and conflicts
+
+Within one entrypoint, TCP routers use the identical three-tier precedence
+as HTTP routers (`model.TCPPrecedence`): explicit `.priority` (descending)
+first, then rule specificity (the length of the rule expression,
+descending), then router name (ascending) as the final tie-breaker.
+
+Because Envoy's `FilterChainMatch` has no priority concept of its own — it
+picks the single best-matching chain, and two chains that could both claim
+the same connection with no way to prefer one is a configuration error, not
+something map iteration should silently arbitrate — this control plane
+detects ambiguous overlaps deterministically at build time rather than
+depending on which chain a map walk happens to emit first:
+
+- Two routers on the same entrypoint, same TLS mode (raw vs. passthrough),
+  in the **same precedence tier** (both with no explicit priority, or both
+  with the identical explicit priority value), whose `HostSNI(...)` sets
+  overlap (either both are the catch-all, or they share a concrete SNI
+  value) are rejected with an actionable error naming both routers, the
+  entrypoint, and the overlapping values.
+- A concrete SNI match and the catch-all on the same entrypoint/TLS-mode
+  are **not** a conflict: Envoy's filter-chain matching always prefers the
+  more specific (concrete `server_names`) chain over the fallback, so no
+  priority is needed to arbitrate that case.
+- Distinct explicit priorities are never a conflict, regardless of SNI
+  overlap: the higher priority's chain is ordered first, exactly mirroring
+  HTTP `.priority`.
+- Raw and passthrough chains on the same entrypoint never conflict with
+  each other: they match mutually exclusive `transport_protocol` values
+  (`raw_buffer` vs. `tls`) at the Envoy filter-chain level.
+
+### Example
+
+```yaml
+labels:
+  envoy.enable: "true"
+  envoy.tcp.routers.secure.rule: "HostSNI(mail.example.com)"
+  envoy.tcp.routers.secure.service: mailserver
+  envoy.tcp.routers.secure.tls.passthrough: "true"
+  envoy.tcp.routers.secure.entrypoints: websecure
+  envoy.tcp.services.mailserver.loadbalancer.servers.0.port: "993"
+
+  envoy.tcp.routers.catchall.rule: "HostSNI(*)"
+  envoy.tcp.routers.catchall.service: fallback
+  envoy.tcp.routers.catchall.tls.passthrough: "true"
+  envoy.tcp.routers.catchall.entrypoints: websecure
+  envoy.tcp.services.fallback.loadbalancer.servers.0.port: "443"
+
+  envoy.tcp.routers.raw.rule: "HostSNI(*)"
+  envoy.tcp.routers.raw.service: db
+  envoy.tcp.routers.raw.entrypoints: db
+  envoy.tcp.services.db.loadbalancer.servers.0.port: "5432"
+```
+
+With `TCP_ENTRYPOINTS=websecure=8443,db=5432` in the control plane's
+environment: `secure` and `catchall` share the `websecure` listener (the
+concrete `mail.example.com` match takes precedence over the catch-all
+automatically; no `.priority` label is needed), and `raw` gets its own `db`
+listener with no TLS inspection since it is not TLS passthrough.
+
+### Limitations
+
+- No TCP middlewares in this milestone (no rate limiting, IP filtering,
+  etc. on TCP routers).
+- A raw TCP router's rule must be exactly `HostSNI(*)`; concrete SNI
+  matching requires TLS passthrough (or termination, which is out of scope
+  here).
+- `HostSNI` is the only TCP matcher; there is no TCP equivalent of
+  `Path`/`Headers`/`Method`/etc., since those are HTTP-layer concepts.

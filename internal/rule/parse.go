@@ -458,8 +458,21 @@ func buildAtoms(name string, args []string) ([]model.Atom, error) {
 		}
 		return out, nil
 
+	case "hostsni":
+		if len(args) == 0 {
+			return nil, fmt.Errorf("HostSNI requires at least one SNI value")
+		}
+		out := make([]model.Atom, 0, len(args))
+		for _, a := range args {
+			if a == "" {
+				return nil, fmt.Errorf("HostSNI requires a non-empty SNI value or the catch-all *")
+			}
+			out = append(out, model.NewSNI(a))
+		}
+		return out, nil
+
 	default:
-		return nil, fmt.Errorf("unknown matcher %q (supported: Host, Path, PathPrefix, Headers, Method, Query, ClientIP)", name)
+		return nil, fmt.Errorf("unknown matcher %q (supported: Host, Path, PathPrefix, Headers, Method, Query, ClientIP, HostSNI)", name)
 	}
 }
 

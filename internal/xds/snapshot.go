@@ -48,6 +48,17 @@ type Config struct {
 	HTTPSPort          uint32
 	CertSecretName     string
 	ACMESDSClusterName string
+
+	// TCPEntrypoints maps a statically configured TCP entrypoint name to the
+	// port its listener binds. Entrypoint addresses/ports are daemon
+	// (operator) configuration, never derived from untrusted container
+	// labels: a label can only select an entrypoint by name via
+	// envoy.tcp.routers.<name>.entrypoints, never bind a new host socket.
+	TCPEntrypoints map[string]uint32
+	// DefaultTCPEntrypoint is the entrypoint name a TCP router with no
+	// explicit .entrypoints label is served on. Empty means "the router
+	// must set .entrypoints explicitly" (no implicit default).
+	DefaultTCPEntrypoint string
 }
 
 // Merge combines docker-derived and static routes into one map keyed by
@@ -81,6 +92,13 @@ func BuildSnapshot(version string, routes map[string]model.Route, cfg Config) (c
 // route match (e.g. ClientIP, or negation on a non-header matcher) are
 // skipped with an actionable warning instead of failing the whole snapshot.
 func BuildSnapshotWithLogger(version string, routes map[string]model.Route, cfg Config, logger *slog.Logger) (cachev3.ResourceSnapshot, error) {
+	return BuildSnapshotWithLoggerAndTCP(version, routes, model.TCPConfiguration{}, cfg, logger)
+}
+
+// BuildSnapshotWithLoggerAndTCP extends BuildSnapshotWithLogger with TCP
+// routers/services, contributing their own listeners and clusters/endpoints
+// alongside the legacy HTTP-route-map path.
+func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route, tcpCfg model.TCPConfiguration, cfg Config, logger *slog.Logger) (cachev3.ResourceSnapshot, error) {
 	if err := validateNoErrorRecursion(routes); err != nil {
 		return nil, err
 	}
@@ -175,11 +193,28 @@ func BuildSnapshotWithLogger(version string, routes map[string]model.Route, cfg 
 	httpsListener := buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName, plan)
 	applySecurityDefaults(routeConfig, plan)
 
+	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("building tcp resources: %w", err)
+	}
+	for _, c := range tcpClusters {
+		name := c.(*clusterv3.Cluster).Name
+		if owner, exists := clusterOwners[name]; exists {
+			return nil, fmt.Errorf("xDS cluster name %q collides between %s and a tcp resource", name, owner)
+		}
+		clusterOwners[name] = "tcp resource"
+	}
+	clusters = append(clusters, tcpClusters...)
+	endpoints = append(endpoints, tcpEndpoints...)
+
+	listeners := []cachetypes.Resource{httpListener, httpsListener}
+	listeners = append(listeners, tcpListeners...)
+
 	resources := map[resourcev3.Type][]cachetypes.Resource{
 		resourcev3.ClusterType:  clusters,
 		resourcev3.EndpointType: endpoints,
 		resourcev3.RouteType:    {routeConfig},
-		resourcev3.ListenerType: {httpListener, httpsListener},
+		resourcev3.ListenerType: listeners,
 	}
 
 	snap, err := cachev3.NewSnapshot(version, resources)

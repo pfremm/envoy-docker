@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -51,6 +52,19 @@ type Config struct {
 	InfoEndpointEnabled bool
 	// InfoPort is the port the info page listens on, when enabled.
 	InfoPort uint32
+
+	// TCPEntrypoints maps a statically configured TCP entrypoint name to
+	// the port its listener binds, from the TCP_ENTRYPOINTS environment
+	// variable (format "name=port,name2=port2"). Entrypoint addresses/
+	// ports are daemon (operator) configuration: a container label can
+	// only select among these names via envoy.tcp.routers.<r>.entrypoints,
+	// never bind a new host socket of its own.
+	TCPEntrypoints map[string]uint32
+	// DefaultTCPEntrypoint is the entrypoint name a TCP router with no
+	// explicit .entrypoints label is served on, from the
+	// TCP_DEFAULT_ENTRYPOINT environment variable. Empty means a TCP
+	// router must set .entrypoints explicitly (no implicit default).
+	DefaultTCPEntrypoint string
 }
 
 func Load() (Config, error) {
@@ -111,7 +125,49 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	cfg.TCPEntrypoints, err = parseTCPEntrypoints(os.Getenv("TCP_ENTRYPOINTS"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DefaultTCPEntrypoint = os.Getenv("TCP_DEFAULT_ENTRYPOINT")
+	if cfg.DefaultTCPEntrypoint != "" {
+		if _, ok := cfg.TCPEntrypoints[cfg.DefaultTCPEntrypoint]; !ok {
+			return Config{}, fmt.Errorf("TCP_DEFAULT_ENTRYPOINT %q is not one of the configured TCP_ENTRYPOINTS", cfg.DefaultTCPEntrypoint)
+		}
+	}
+
 	return cfg, nil
+}
+
+// parseTCPEntrypoints parses the TCP_ENTRYPOINTS environment variable
+// ("name=port,name2=port2") into a name -> port map. An empty string
+// returns an empty (non-nil) map: TCP is simply unconfigured.
+func parseTCPEntrypoints(v string) (map[string]uint32, error) {
+	out := map[string]uint32{}
+	if v == "" {
+		return out, nil
+	}
+	for _, entry := range strings.Split(v, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, portStr, ok := strings.Cut(entry, "=")
+		name = strings.TrimSpace(name)
+		portStr = strings.TrimSpace(portStr)
+		if !ok || name == "" || portStr == "" {
+			return nil, fmt.Errorf("TCP_ENTRYPOINTS entry %q must be name=port", entry)
+		}
+		port, err := strconv.ParseUint(portStr, 10, 16)
+		if err != nil || port == 0 {
+			return nil, fmt.Errorf("TCP_ENTRYPOINTS entry %q: invalid port %q", entry, portStr)
+		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("TCP_ENTRYPOINTS defines entrypoint %q more than once", name)
+		}
+		out[name] = uint32(port)
+	}
+	return out, nil
 }
 
 func envPort(name string, def uint32) (uint32, error) {
