@@ -21,6 +21,7 @@ import (
 	xffv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/original_ip_detection/xff/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	cachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
@@ -28,6 +29,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
@@ -59,6 +61,19 @@ type Config struct {
 	// explicit .entrypoints label is served on. Empty means "the router
 	// must set .entrypoints explicitly" (no implicit default).
 	DefaultTCPEntrypoint string
+
+	// HTTPEntrypoints maps a statically configured HTTP entrypoint name to
+	// the port its listener binds. Entrypoint addresses/ports are daemon
+	// (operator) configuration, never derived from untrusted container
+	// labels: a label can only select an entrypoint by name via
+	// envoy.http.routers.<name>.entrypoints, never bind a new host socket.
+	// The default HTTP/HTTPS entrypoints (HTTPPort/HTTPSPort) always exist
+	// and are the fallback for legacy routers that set no .entrypoints.
+	HTTPEntrypoints map[string]uint32
+	// DefaultHTTPEntrypoint is the entrypoint name an HTTP router with no
+	// explicit .entrypoints label is served on. Empty means the router is
+	// served on the default HTTP/HTTPS entrypoints (legacy behavior).
+	DefaultHTTPEntrypoint string
 }
 
 // Merge combines docker-derived and static routes into one map keyed by
@@ -103,18 +118,51 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 		return nil, err
 	}
 
-	names := sortedSubdomains(routes)
-	routeConfig := buildHTTPSRouteConfiguration(routes, names, cfg.BaseDomain, logger)
-	published := publishedRoutes(routes, routeConfig)
+	// Group the routes by HTTP entrypoint. The default entrypoint (the
+	// legacy HTTP/HTTPS pair) always exists and carries every router that
+	// sets no .entrypoints label; each configured extra entrypoint carries
+	// only the routers that explicitly select it. A router selecting an
+	// entrypoint the daemon did not configure is rejected: entrypoint
+	// addresses/ports are operator configuration, so a label can only
+	// SELECT among them, never conjure a new bound socket.
+	byEntrypoint, entrypointNames, err := groupRoutesByEntrypoint(routes, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// One RDS route configuration per entrypoint. The default entrypoint
+	// keeps the legacy resource name (https_routes); extra entrypoints get
+	// a namespaced name (https_routes__<entrypoint>).
+	routeConfigs := make([]*routev3.RouteConfiguration, 0, len(entrypointNames))
+	for _, ep := range entrypointNames {
+		epRoutes := byEntrypoint[ep]
+		name := httpsRouteConfigName
+		if ep != defaultEntrypointName {
+			name = httpsRouteConfigName + "__" + ep
+		}
+		rc := buildHTTPSRouteConfiguration(epRoutes, sortedSubdomains(epRoutes), cfg.BaseDomain, logger)
+		rc.Name = name
+		routeConfigs = append(routeConfigs, rc)
+	}
+
+	// The published set is the union across every entrypoint's route config:
+	// a route is published (and gets a cluster/endpoint) if it is served on
+	// any entrypoint.
+	published := make(map[string]model.Route)
+	for _, rc := range routeConfigs {
+		for subdomain, route := range publishedRoutes(routes, rc) {
+			published[subdomain] = route
+		}
+	}
 
 	plan, err := planSecurity(published)
 	if err != nil {
 		return nil, fmt.Errorf("planning security middleware: %w", err)
 	}
 
-	clusters := make([]cachetypes.Resource, 0, len(names)+len(plan.authClusters))
-	endpoints := make([]cachetypes.Resource, 0, len(names))
-	clusterOwners := make(map[string]string, len(names)+len(plan.authClusters))
+	clusters := make([]cachetypes.Resource, 0, len(published)+len(plan.authClusters))
+	endpoints := make([]cachetypes.Resource, 0, len(published))
+	clusterOwners := make(map[string]string, len(published)+len(plan.authClusters))
 	for _, name := range sortedSubdomains(published) {
 		route := published[name]
 		if owner, exists := clusterOwners[route.ClusterName()]; exists {
@@ -173,7 +221,12 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 			endpoints = append(endpoints, ep)
 		}
 		if len(routeOverride) > 0 {
-			redirectRouteClusters(routeConfig, routeOverride)
+			// A route name can appear in more than one entrypoint's route
+			// config (a router served on several entrypoints); redirect every
+			// occurrence to the same variant cluster.
+			for _, rc := range routeConfigs {
+				redirectRouteClusters(rc, routeOverride)
+			}
 		}
 	}
 
@@ -186,12 +239,35 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 			}
 			return "", false
 		})
-		routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, errorVHosts...)
+		// The error-service virtual hosts are attached to every entrypoint's
+		// route config so error responses resolve on any entrypoint.
+		for _, rc := range routeConfigs {
+			rc.VirtualHosts = append(rc.VirtualHosts, errorVHosts...)
+		}
 	}
 
-	httpListener := buildHTTPListener(cfg.HTTPPort)
-	httpsListener := buildHTTPSListener(cfg.HTTPSPort, cfg.CertSecretName, cfg.ACMESDSClusterName, plan)
-	applySecurityDefaults(routeConfig, plan)
+	applySecurityDefaultsToAll(routeConfigs, plan)
+
+	// The default entrypoint's listeners are the legacy http_listener (plain
+	// HTTP -> HTTPS redirect) and https_listener (TLS, RDS). Each extra
+	// entrypoint gets its own TLS listener on its configured port, serving
+	// its own RDS route config.
+	listeners := []cachetypes.Resource{
+		buildHTTPListener(cfg.HTTPPort),
+		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan),
+	}
+	for _, ep := range entrypointNames {
+		if ep == defaultEntrypointName {
+			continue
+		}
+		port, ok := cfg.HTTPEntrypoints[ep]
+		if !ok {
+			return nil, fmt.Errorf("internal error: entrypoint %q has no configured port", ep)
+		}
+		listeners = append(listeners, buildHTTPSListener(
+			httpsListenerName+"__"+ep, port, httpsRouteConfigName+"__"+ep,
+			cfg.CertSecretName, cfg.ACMESDSClusterName, plan))
+	}
 
 	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg)
 	if err != nil {
@@ -206,14 +282,17 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 	}
 	clusters = append(clusters, tcpClusters...)
 	endpoints = append(endpoints, tcpEndpoints...)
-
-	listeners := []cachetypes.Resource{httpListener, httpsListener}
 	listeners = append(listeners, tcpListeners...)
+
+	routeConfigResources := make([]cachetypes.Resource, 0, len(routeConfigs))
+	for _, rc := range routeConfigs {
+		routeConfigResources = append(routeConfigResources, rc)
+	}
 
 	resources := map[resourcev3.Type][]cachetypes.Resource{
 		resourcev3.ClusterType:  clusters,
 		resourcev3.EndpointType: endpoints,
-		resourcev3.RouteType:    {routeConfig},
+		resourcev3.RouteType:    routeConfigResources,
 		resourcev3.ListenerType: listeners,
 	}
 
@@ -222,6 +301,54 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 		return nil, fmt.Errorf("building snapshot: %w", err)
 	}
 	return snap, nil
+}
+
+// defaultEntrypointName is the internal name of the legacy HTTP/HTTPS
+// entrypoint pair (HTTP_PORT/HTTPS_PORT). Routers that set no .entrypoints
+// label are served on it.
+const defaultEntrypointName = "default"
+
+// groupRoutesByEntrypoint resolves each route's effective HTTP entrypoint
+// list (explicit .entrypoints, or the configured default, or the implicit
+// default entrypoint) and groups the routes by entrypoint. A route selecting
+// an entrypoint the daemon did not configure is rejected. The returned
+// entrypointNames is sorted and always includes the default entrypoint.
+func groupRoutesByEntrypoint(routes map[string]model.Route, cfg Config) (map[string]map[string]model.Route, []string, error) {
+	byEntrypoint := map[string]map[string]model.Route{defaultEntrypointName: {}}
+	for _, name := range sortedSubdomains(routes) {
+		route := routes[name]
+		eps := route.Entrypoints
+		if len(eps) == 0 {
+			if cfg.DefaultHTTPEntrypoint != "" {
+				eps = []string{cfg.DefaultHTTPEntrypoint}
+			} else {
+				eps = []string{defaultEntrypointName}
+			}
+		}
+		for _, ep := range eps {
+			if ep != defaultEntrypointName {
+				if _, ok := cfg.HTTPEntrypoints[ep]; !ok {
+					return nil, nil, fmt.Errorf("http router %q references unknown entrypoint %q (configured entrypoints: %v)", name, ep, sortedEntrypointNames(cfg.HTTPEntrypoints))
+				}
+			}
+			if byEntrypoint[ep] == nil {
+				byEntrypoint[ep] = map[string]model.Route{}
+			}
+			byEntrypoint[ep][name] = route
+		}
+	}
+	names := make([]string, 0, len(byEntrypoint))
+	for ep := range byEntrypoint {
+		if len(byEntrypoint[ep]) == 0 {
+			// The default entrypoint is always present in the map (so a
+			// router can explicitly select it), but it only earns a route
+			// config and listener when a route is actually served on it.
+			continue
+		}
+		names = append(names, ep)
+	}
+	sort.Strings(names)
+	return byEntrypoint, names, nil
 }
 
 // redirectRouteClusters rewrites RouteAction.Cluster for every route whose
@@ -421,6 +548,7 @@ func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Rout
 			return nil
 		}
 		applyRouteSecurity(er, route.Middlewares)
+		applyRouteObservability(er, route)
 		return []*routev3.Route{er}
 	}
 
@@ -476,6 +604,7 @@ func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Rout
 			return nil
 		}
 		applyRouteSecurity(er, route.Middlewares)
+		applyRouteObservability(er, route)
 		out = append(out, er)
 	}
 	return out
@@ -486,6 +615,71 @@ func routeResourceName(route model.Route) string {
 		return route.RouterName
 	}
 	return route.Subdomain
+}
+
+// observabilityMetadataNamespace is the Envoy route-metadata namespace this
+// control plane uses to carry the .accesslog hook. It is a declarative carrier
+// of intent: Envoy access logging is listener-scoped (the pinned API has no
+// per-route access-log field), so this metadata records the operator's intent
+// without altering routing behavior. It never carries secrets or raw auth
+// headers (see LABELS.md limitations).
+const observabilityMetadataNamespace = "envoy-control-plane.observability"
+
+// applyRouteObservability applies a route's per-route observability hooks to a
+// generated Envoy route:
+//
+//   - .tracing.operationname -> Route.Tracing.Operation: the per-route span
+//     name (the pinned API's per-route tracing field; it takes precedence over
+//     the route decorator and the HCM tracing operation).
+//   - .tracing=true|false -> Route.Tracing sampling: true forces 100% sampling,
+//     false disables tracing for the route's traffic (0% sampling).
+//   - .accesslog=true|false -> route metadata under the observability namespace
+//     (a declarative carrier; access logging itself is listener-scoped).
+//
+// A nil route.Tracing leaves tracing at the listener/HCM default. Only the
+// fields the operator set are emitted, so an unset hook never overrides the
+// listener-level configuration.
+func applyRouteObservability(er *routev3.Route, route model.Route) {
+	if route.Tracing != nil {
+		tr := &routev3.Tracing{}
+		if route.Tracing.OperationName != "" {
+			tr.Operation = route.Tracing.OperationName
+		}
+		if route.Tracing.Enabled {
+			tr.OverallSampling = &typev3.FractionalPercent{
+				Numerator:   100,
+				Denominator: typev3.FractionalPercent_HUNDRED,
+			}
+		} else {
+			tr.OverallSampling = &typev3.FractionalPercent{
+				Numerator:   0,
+				Denominator: typev3.FractionalPercent_HUNDRED,
+			}
+		}
+		er.Tracing = tr
+	}
+	if route.AccessLog != nil {
+		enabled := *route.AccessLog
+		md := er.Metadata
+		if md == nil {
+			md = &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{}}
+		}
+		if md.FilterMetadata == nil {
+			md.FilterMetadata = map[string]*structpb.Struct{}
+		}
+		st, err := structpb.NewStruct(map[string]any{
+			"accesslog": enabled,
+			"subdomain": route.Subdomain,
+			"router":    routeResourceName(route),
+		})
+		if err != nil {
+			// The struct is built from fixed string/bool values; failure is a
+			// programming error, not a runtime condition.
+			panic(fmt.Sprintf("xds: building observability metadata: %v", err))
+		}
+		md.FilterMetadata[observabilityMetadataNamespace] = st
+		er.Metadata = md
+	}
 }
 
 func publishedRoutes(routes map[string]model.Route, rc *routev3.RouteConfiguration) map[string]model.Route {
@@ -679,11 +873,13 @@ func buildHTTPListener(port uint32) *listenerv3.Listener {
 	}
 }
 
-// buildHTTPSListener returns the TLS listener that serves routed traffic.
-// Its routes come from RDS (dynamic, via ADS); its certificate comes from
-// SDS served by the separate envoy-acme control plane, referenced here only
-// by cluster name + secret name.
-func buildHTTPSListener(port uint32, certSecretName, acmeSDSClusterName string, plan *securityPlan) *listenerv3.Listener {
+// buildHTTPSListener returns a TLS listener that serves routed traffic. Its
+// routes come from RDS (dynamic, via ADS) under routeConfigName; its
+// certificate comes from SDS served by the separate envoy-acme control plane,
+// referenced here only by cluster name + secret name. listenerName names the
+// generated listener (the default entrypoint uses the legacy "https_listener";
+// extra entrypoints use "https_listener__<entrypoint>").
+func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certSecretName, acmeSDSClusterName string, plan *securityPlan) *listenerv3.Listener {
 	filters := make([]*hcmv3.HttpFilter, 0, 3+len(plan.listenerFilters))
 	var extAuthzFilter, basicAuthRemoveFilter *hcmv3.HttpFilter
 	for _, filter := range plan.listenerFilters {
@@ -728,7 +924,7 @@ func buildHTTPSListener(port uint32, certSecretName, acmeSDSClusterName string, 
 		StatPrefix: "https",
 		RouteSpecifier: &hcmv3.HttpConnectionManager_Rds{
 			Rds: &hcmv3.Rds{
-				RouteConfigName: httpsRouteConfigName,
+				RouteConfigName: routeConfigName,
 				ConfigSource:    adsConfigSource(),
 			},
 		},
@@ -761,7 +957,7 @@ func buildHTTPSListener(port uint32, certSecretName, acmeSDSClusterName string, 
 	}
 
 	return &listenerv3.Listener{
-		Name:    httpsListenerName,
+		Name:    listenerName,
 		Address: listenerAddress(port),
 		FilterChains: []*listenerv3.FilterChain{
 			{

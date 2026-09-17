@@ -22,6 +22,10 @@ services:
       # they can never bind a new host port of their own.
       TCP_ENTRYPOINTS: "websecure=8443,db=5432"
       TCP_DEFAULT_ENTRYPOINT: websecure
+      # Optional extra HTTP/HTTPS entrypoints, same "name=port" shape and the
+      # same never-bind-arbitrary-sockets rule as TCP_ENTRYPOINTS above. The
+      # legacy HTTP_PORT/HTTPS_PORT pair always exists regardless of this.
+      HTTP_ENTRYPOINTS: "admin=8444"
       # Optional read-only HTML page showing discovered/configured routes.
       INFO_ENDPOINT_ENABLED: "true"
       INFO_PORT: "9902"
@@ -73,6 +77,8 @@ services:
       # container; expose the ones you want reachable from the host.
       - "8443:8443" # websecure TCP entrypoint (TLS passthrough demo below)
       - "5432:5432" # db TCP entrypoint (raw TCP demo below)
+      # HTTP entrypoints declared above (HTTP_ENTRYPOINTS); same idea.
+      - "8444:8444" # admin HTTP entrypoint (see myapp-admin demo below)
     networks:
       - proxy
 
@@ -106,6 +112,26 @@ services:
       envoy.http.middlewares.app-prefix.addprefix.prefix: /internal
       envoy.http.middlewares.secure-headers.headers.response.X-Content-Type-Options: nosniff
       envoy.http.middlewares.secure-headers.headers.removeresponse: Server
+
+      # Observability hooks: trace this router's traffic with a named span,
+      # and record accesslog=true as route metadata (see docs/LABELS.md;
+      # access logging itself is configured listener-wide in bootstrap.yaml.tmpl).
+      envoy.http.routers.web.tracing: "true"
+      envoy.http.routers.web.tracing.operationname: myapp-ingress
+      envoy.http.routers.web.accesslog: "true"
+    networks:
+      - proxy
+
+  # Same demo app, additionally reachable on the dedicated "admin" HTTP
+  # entrypoint declared above (HTTP_ENTRYPOINTS=admin=8444) as
+  # https://myapp-admin.nas.pfrem.me:8444, alongside the default entrypoint.
+  myapp-admin:
+    image: nginx:alpine
+    labels:
+      envoy.enable: "true"
+      envoy.http.routers.admin.subdomain: myapp-admin
+      envoy.http.routers.admin.port: "80"
+      envoy.http.routers.admin.entrypoints: admin
     networks:
       - proxy
 

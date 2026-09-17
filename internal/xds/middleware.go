@@ -45,10 +45,6 @@ func applyRouteMiddlewares(er *routev3.Route, chain []model.Middleware) error {
 		delete(er.TypedPerFilterConfig, bufferFilterName)
 		delete(er.TypedPerFilterConfig, grpcWebFilterName)
 	}
-	// Retry policy is on the RouteAction, not per-filter config
-	if ra := er.GetRoute(); ra != nil {
-		ra.RetryPolicy = nil
-	}
 	var mutationOps []model.Middleware
 	for _, m := range chain {
 		switch {

@@ -383,7 +383,7 @@ func TestComposedAuthFilterOrderAuthorizesFinalRequestAndRemovesCredentials(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	hcm := decodeHCM(t, buildHTTPSListener(443, "cert", "sds", plan))
+	hcm := decodeHCM(t, buildHTTPSListener(httpsListenerName, 443, httpsRouteConfigName, "cert", "sds", plan))
 	got := strings.Join(filterNames(hcm), ",")
 	want := strings.Join([]string{
 		basicAuthFilterName,

@@ -56,13 +56,15 @@ func run(logger *slog.Logger) error {
 	adsServer := xds.NewServer(logger)
 
 	snapCfg := xds.Config{
-		BaseDomain:           cfg.BaseDomain,
-		HTTPPort:             cfg.HTTPPort,
-		HTTPSPort:            cfg.HTTPSPort,
-		CertSecretName:       cfg.CertSecretName,
-		ACMESDSClusterName:   cfg.ACMESDSClusterName,
-		TCPEntrypoints:       cfg.TCPEntrypoints,
-		DefaultTCPEntrypoint: cfg.DefaultTCPEntrypoint,
+		BaseDomain:            cfg.BaseDomain,
+		HTTPPort:              cfg.HTTPPort,
+		HTTPSPort:             cfg.HTTPSPort,
+		CertSecretName:        cfg.CertSecretName,
+		ACMESDSClusterName:    cfg.ACMESDSClusterName,
+		TCPEntrypoints:        cfg.TCPEntrypoints,
+		DefaultTCPEntrypoint:  cfg.DefaultTCPEntrypoint,
+		HTTPEntrypoints:       cfg.HTTPEntrypoints,
+		DefaultHTTPEntrypoint: cfg.DefaultHTTPEntrypoint,
 	}
 
 	var infoSrv *infoserver.Server
