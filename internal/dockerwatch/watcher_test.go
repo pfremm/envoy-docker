@@ -366,3 +366,17 @@ func TestContainerIP(t *testing.T) {
 		t.Error("containerIP() expected error when NetworkSettings is nil")
 	}
 }
+
+func TestDiscoverConflictingRoutersUsesPriority(t *testing.T) {
+	mk := func(id, rule, priority, ip string) container.Summary {
+		return container.Summary{ID: id, Names: []string{"/" + id}, Labels: map[string]string{
+			"envoy.enable": "true", "envoy.http.routers.web.subdomain": "app",
+			"envoy.http.routers.web.port": "8080", "envoy.http.routers.web.rule": rule,
+			"envoy.http.routers.web.priority": priority,
+		}, NetworkSettings: &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{"proxy": {IPAddress: ip}}}}
+	}
+	cfg := discover([]container.Summary{mk("low", "Host(app.example.com)", "1", "10.0.0.1"), mk("high", "Host(app.example.com) && PathPrefix(`/admin`)", "10", "10.0.0.2")}, "proxy", nil)
+	if got := cfg.Routes["app"].Origin; !strings.HasPrefix(got, "high/") {
+		t.Fatalf("winner=%q", got)
+	}
+}

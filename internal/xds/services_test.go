@@ -53,7 +53,7 @@ func TestBuildSnapshotForConfigNamedServicePolicies(t *testing.T) {
 	if a.GetCluster() != name || a.Timeout.AsDuration() != 30*time.Second || a.IdleTimeout.AsDuration() != 5*time.Second {
 		t.Fatalf("action=%+v", a)
 	}
-	if a.RetryPolicy.GetNumRetries().Value != 3 || a.RetryPolicy.PerTryTimeout.AsDuration() != 2*time.Second || a.RetryPolicy.RetryOn != "5xx,reset" {
+	if a.RetryPolicy.GetNumRetries().Value != 2 || a.RetryPolicy.PerTryTimeout.AsDuration() != 2*time.Second || a.RetryPolicy.RetryOn != "5xx,reset" {
 		t.Fatalf("retry=%+v", a.RetryPolicy)
 	}
 	cookie := a.HashPolicy[0].GetCookie()

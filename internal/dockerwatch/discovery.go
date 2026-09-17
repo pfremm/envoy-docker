@@ -454,7 +454,15 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 			old, exists := cfg.Routes[r.subdomain]
 			if exists {
 				if !routesCompatible(old, route) {
-					logger.Warn("skipping router: subdomain already claimed by a conflicting route definition", "container", name, "router", rn, "subdomain", r.subdomain)
+					// A subdomain can only be represented by one route in the
+					// current model. Resolve competing routers using the same
+					// deterministic precedence as xDS; a loser is non-fatal.
+					if model.Precedence(route, old) {
+						logger.Warn("replacing lower-precedence router conflict", "subdomain", r.subdomain, "kept", route.Origin, "skipped", old.Origin)
+						cfg.Routes[r.subdomain] = route
+					} else {
+						logger.Warn("skipping lower-precedence router conflict", "subdomain", r.subdomain, "kept", old.Origin, "skipped", route.Origin)
+					}
 					continue
 				}
 				old.Endpoints = append(old.Endpoints, route.Endpoints...)
@@ -479,7 +487,7 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 
 func routesCompatible(a, b model.Route) bool {
 	if a.RuleExpr != b.RuleExpr || a.ServiceName != b.ServiceName || a.Priority != b.Priority ||
-		a.PrioritySet != b.PrioritySet || a.RouterName != b.RouterName || a.DiscoveryNetwork != b.DiscoveryNetwork ||
+		a.PrioritySet != b.PrioritySet || a.DiscoveryNetwork != b.DiscoveryNetwork ||
 		!reflect.DeepEqual(a.MiddlewareNames, b.MiddlewareNames) ||
 		!reflect.DeepEqual(a.Timeout, b.Timeout) || !reflect.DeepEqual(a.IdleTimeout, b.IdleTimeout) || !reflect.DeepEqual(a.Retry, b.Retry) ||
 		!reflect.DeepEqual(a.Entrypoints, b.Entrypoints) || !reflect.DeepEqual(a.Tracing, b.Tracing) || !reflect.DeepEqual(a.AccessLog, b.AccessLog) {

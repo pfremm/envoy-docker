@@ -57,8 +57,8 @@ func TestApplyRouteMiddlewares_Retry(t *testing.T) {
 				if ra.RetryPolicy.RetryOn != "5xx,reset" {
 					t.Errorf("RetryOn = %q, want \"5xx,reset\"", ra.RetryPolicy.RetryOn)
 				}
-				if ra.RetryPolicy.NumRetries.GetValue() != 3 {
-					t.Errorf("NumRetries = %d, want 3", ra.RetryPolicy.NumRetries.GetValue())
+				if ra.RetryPolicy.NumRetries.GetValue() != 2 {
+					t.Errorf("NumRetries = %d, want 2", ra.RetryPolicy.NumRetries.GetValue())
 				}
 				want := durationpb.New(1000000000) // 1s
 				if ra.RetryPolicy.PerTryTimeout.Seconds != want.Seconds {
@@ -70,6 +70,15 @@ func TestApplyRouteMiddlewares_Retry(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestApplyRouteMiddlewares_RetryZeroAttemptsDoesNotUnderflow(t *testing.T) {
+	route := &routev3.Route{Action: &routev3.Route_Route{Route: &routev3.RouteAction{}}}
+	mw := []model.Middleware{{Name: "retry", Retry: &model.RetryMiddleware{Attempts: 0, PerTryTimeout: "1s", RetryOn: "5xx"}}}
+
+	if err := applyRouteMiddlewares(route, mw); err == nil {
+		t.Fatal("applyRouteMiddlewares() accepted zero retry attempts")
 	}
 }
 

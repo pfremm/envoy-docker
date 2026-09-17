@@ -443,8 +443,10 @@ func configuredRouteAction(route model.Route, cfg model.HTTPConfiguration) *rout
 	}
 	if r := route.Retry; r != nil {
 		a.RetryPolicy = &routev3.RetryPolicy{RetryOn: r.RetryOn}
-		if r.Attempts > 0 {
-			a.RetryPolicy.NumRetries = wrapperspb.UInt32(r.Attempts)
+		if r.Attempts > 1 {
+			a.RetryPolicy.NumRetries = wrapperspb.UInt32(r.Attempts - 1)
+		} else {
+			a.RetryPolicy.NumRetries = wrapperspb.UInt32(0)
 		}
 		if r.PerTryTimeout > 0 {
 			a.RetryPolicy.PerTryTimeout = durationpb.New(r.PerTryTimeout)

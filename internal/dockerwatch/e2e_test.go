@@ -187,8 +187,8 @@ func TestEndToEnd_FullContractAcrossFeatures(t *testing.T) {
 	}
 	if action := apiRoute.GetRoute(); action == nil || action.GetRetryPolicy() == nil {
 		t.Errorf("api route should carry a retry policy, got route=%+v", apiRoute)
-	} else if action.GetRetryPolicy().GetNumRetries().GetValue() != 3 {
-		t.Errorf("api route retry attempts = %v, want 3", action.GetRetryPolicy().GetNumRetries())
+	} else if action.GetRetryPolicy().GetNumRetries().GetValue() != 2 {
+		t.Errorf("api route retry attempts = %v, want 2", action.GetRetryPolicy().GetNumRetries())
 	}
 
 	// admin route explicitly disabled tracing (0% sampling), on its own

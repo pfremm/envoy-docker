@@ -80,6 +80,9 @@ type Config struct {
 	// HTTP_DEFAULT_ENTRYPOINT environment variable. Empty means the router
 	// is served on the default HTTP/HTTPS entrypoints (legacy behavior).
 	DefaultHTTPEntrypoint string
+	// DefaultHTTPEntrypoints is the ordered list used when a router omits
+	// .entrypoints. The singular field remains for compatibility.
+	DefaultHTTPEntrypoints []string
 }
 
 func Load() (Config, error) {
@@ -156,13 +159,45 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.DefaultHTTPEntrypoint = os.Getenv("HTTP_DEFAULT_ENTRYPOINT")
-	if cfg.DefaultHTTPEntrypoint != "" {
-		if _, ok := cfg.HTTPEntrypoints[cfg.DefaultHTTPEntrypoint]; !ok {
-			return Config{}, fmt.Errorf("HTTP_DEFAULT_ENTRYPOINT %q is not one of the configured HTTP_ENTRYPOINTS", cfg.DefaultHTTPEntrypoint)
+	defaults := os.Getenv("HTTP_DEFAULT_ENTRYPOINTS")
+	if defaults == "" && cfg.DefaultHTTPEntrypoint != "" {
+		defaults = cfg.DefaultHTTPEntrypoint
+	}
+	if defaults != "" {
+		for _, ep := range strings.Split(defaults, ",") {
+			ep = strings.TrimSpace(ep)
+			if ep == "" {
+				return Config{}, fmt.Errorf("HTTP_DEFAULT_ENTRYPOINTS contains an empty entrypoint")
+			}
+			if _, ok := cfg.HTTPEntrypoints[ep]; !ok && ep != "default" {
+				return Config{}, fmt.Errorf("HTTP_DEFAULT_ENTRYPOINTS entrypoint %q is not configured", ep)
+			}
+			cfg.DefaultHTTPEntrypoints = append(cfg.DefaultHTTPEntrypoints, ep)
 		}
+		cfg.DefaultHTTPEntrypoint = cfg.DefaultHTTPEntrypoints[0]
+	}
+	if err := validateSharedEntrypointPorts(cfg.HTTPPort, cfg.HTTPSPort, cfg.HTTPEntrypoints, cfg.TCPEntrypoints); err != nil {
+		return Config{}, err
 	}
 
 	return cfg, nil
+}
+
+func validateSharedEntrypointPorts(httpPort, httpsPort uint32, http, tcp map[string]uint32) error {
+	used := map[uint32]string{httpPort: "default HTTP", httpsPort: "default HTTPS"}
+	for name, port := range http {
+		if prior, ok := used[port]; ok {
+			return fmt.Errorf("HTTP entrypoint %q port %d collides with %s", name, port, prior)
+		}
+		used[port] = "HTTP entrypoint " + name
+	}
+	for name, port := range tcp {
+		if prior, ok := used[port]; ok {
+			return fmt.Errorf("TCP entrypoint %q port %d collides with %s", name, port, prior)
+		}
+		used[port] = "TCP entrypoint " + name
+	}
+	return nil
 }
 
 // parseHTTPEntrypoints parses the HTTP_ENTRYPOINTS environment variable

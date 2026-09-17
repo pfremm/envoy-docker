@@ -30,7 +30,7 @@ number of routers.
 | `envoy.http.routers.<name>.middlewares` | no | Ordered comma/escape list of named HTTP middleware. See [HTTP middleware](#http-middleware). |
 | `envoy.http.routers.<name>.timeout` | no | Total upstream request timeout as a Go duration (`30s`, `500ms`). `0s` disables Envoy's route timeout. |
 | `envoy.http.routers.<name>.idletimeout` | no | Per-route stream idle timeout as a Go duration. `0s` disables it. |
-| `envoy.http.routers.<name>.retries.attempts` | no | Positive retry count. |
+| `envoy.http.routers.<name>.retries.attempts` | no | Positive total attempt count, including the initial request. Envoy receives `attempts-1` retries; `1` means no retry. |
 | `envoy.http.routers.<name>.retries.pertrytimeout` | no | Positive timeout for each try. |
 | `envoy.http.routers.<name>.retries.retryon` | no | Envoy retry conditions, for example `5xx,reset,connect-failure`. |
 | `envoy.http.routers.<name>.entrypoints` | no | Comma/escape list of HTTP entrypoint names (daemon-configured, see [HTTP entrypoints](#http-entrypoints)). Omitted means the default HTTP/HTTPS entrypoints (legacy behavior). |
@@ -236,7 +236,8 @@ that is itself served by a route carrying its own `errors` middleware is
 rejected outright (no recursive error handling).
 
 **Retry** policies are per-route and fully implemented via
-`RouteAction.RetryPolicy`. Middleware retry overrides router-level retry
+`RouteAction.RetryPolicy`. `attempts` is the total number of tries, so Envoy's
+`num_retries` is `attempts-1`; middleware retry overrides router-level retry
 defaults when present.
 
 **Buffering** is per-route and implemented for `maxrequestbytes` only; Envoy's
@@ -447,9 +448,13 @@ operator already configured, never bind a new host socket of its own. This is
 the same trust boundary as TCP: untrusted container labels never get to open
 a listener that wasn't already provisioned by whoever runs the control plane.
 
-A router with no `.entrypoints` label is served on `HTTP_DEFAULT_ENTRYPOINT`
-when set, or otherwise on the always-present legacy default entrypoint — the
-`HTTP_PORT`/`HTTPS_PORT` pair every router used before this feature existed.
+A router with no `.entrypoints` label is served on the ordered list in
+`HTTP_DEFAULT_ENTRYPOINTS` when set (comma-separated, for example
+`public,internal`), or the compatibility alias `HTTP_DEFAULT_ENTRYPOINT`,
+ or otherwise on the always-present legacy default entrypoint. Every name in
+that list must already exist in `HTTP_ENTRYPOINTS`; labels cannot create
+listeners. The list is intentional: an omitted router entrypoint is published
+on every configured default, not just the first one.
 That default entrypoint keeps the legacy resource names (`http_listener`,
 `https_listener`, `https_routes`) so upgrading the control plane binary never
 renames or disrupts a router that never asked for a named entrypoint. Each

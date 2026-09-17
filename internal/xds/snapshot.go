@@ -74,6 +74,9 @@ type Config struct {
 	// explicit .entrypoints label is served on. Empty means the router is
 	// served on the default HTTP/HTTPS entrypoints (legacy behavior).
 	DefaultHTTPEntrypoint string
+	// DefaultHTTPEntrypoints is the ordered default list. The singular field
+	// is retained for compatibility with existing callers.
+	DefaultHTTPEntrypoints []string
 }
 
 // Merge combines docker-derived and static routes into one map keyed by
@@ -114,6 +117,9 @@ func BuildSnapshotWithLogger(version string, routes map[string]model.Route, cfg 
 // routers/services, contributing their own listeners and clusters/endpoints
 // alongside the legacy HTTP-route-map path.
 func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route, tcpCfg model.TCPConfiguration, cfg Config, logger *slog.Logger) (cachev3.ResourceSnapshot, error) {
+	if err := validateEntrypointPorts(cfg); err != nil {
+		return nil, err
+	}
 	if err := validateNoErrorRecursion(routes); err != nil {
 		return nil, err
 	}
@@ -308,6 +314,30 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 // label are served on it.
 const defaultEntrypointName = "default"
 
+func validateEntrypointPorts(cfg Config) error {
+	used := map[uint32]string{cfg.HTTPPort: "default HTTP", cfg.HTTPSPort: "default HTTPS"}
+	for name, port := range cfg.HTTPEntrypoints {
+		if prior, ok := used[port]; ok {
+			return fmt.Errorf("HTTP entrypoint %q port %d collides with %s", name, port, prior)
+		}
+		used[port] = "HTTP entrypoint " + name
+	}
+	for name, port := range cfg.TCPEntrypoints {
+		if prior, ok := used[port]; ok {
+			return fmt.Errorf("TCP entrypoint %q port %d collides with %s", name, port, prior)
+		}
+		used[port] = "TCP entrypoint " + name
+	}
+	for _, ep := range cfg.DefaultHTTPEntrypoints {
+		if ep != defaultEntrypointName {
+			if _, ok := cfg.HTTPEntrypoints[ep]; !ok {
+				return fmt.Errorf("default HTTP entrypoint %q is not configured", ep)
+			}
+		}
+	}
+	return nil
+}
+
 // groupRoutesByEntrypoint resolves each route's effective HTTP entrypoint
 // list (explicit .entrypoints, or the configured default, or the implicit
 // default entrypoint) and groups the routes by entrypoint. A route selecting
@@ -319,7 +349,9 @@ func groupRoutesByEntrypoint(routes map[string]model.Route, cfg Config) (map[str
 		route := routes[name]
 		eps := route.Entrypoints
 		if len(eps) == 0 {
-			if cfg.DefaultHTTPEntrypoint != "" {
+			if len(cfg.DefaultHTTPEntrypoints) > 0 {
+				eps = append([]string(nil), cfg.DefaultHTTPEntrypoints...)
+			} else if cfg.DefaultHTTPEntrypoint != "" {
 				eps = []string{cfg.DefaultHTTPEntrypoint}
 			} else {
 				eps = []string{defaultEntrypointName}

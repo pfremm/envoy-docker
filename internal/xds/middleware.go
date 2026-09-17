@@ -76,9 +76,13 @@ func applyRouteMiddlewares(er *routev3.Route, chain []model.Middleware) error {
 		case m.Retry != nil:
 			if ra := er.GetRoute(); ra != nil {
 				timeout, _ := parseDuration(m.Retry.PerTryTimeout)
+				numRetries := uint32(0)
+				if m.Retry.Attempts > 1 {
+					numRetries = m.Retry.Attempts - 1
+				}
 				ra.RetryPolicy = &routev3.RetryPolicy{
 					RetryOn:       m.Retry.RetryOn,
-					NumRetries:    wrapperspb.UInt32(m.Retry.Attempts),
+					NumRetries:    wrapperspb.UInt32(numRetries),
 					PerTryTimeout: durationpb.New(timeout),
 				}
 			}
