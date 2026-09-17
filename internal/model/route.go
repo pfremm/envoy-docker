@@ -2,7 +2,10 @@
 // watcher, the static config loader, and the xDS snapshot builder.
 package model
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Endpoint is a single backend address:port a route can be load balanced to.
 type Endpoint struct {
@@ -49,6 +52,49 @@ type Route struct {
 	// envoy.http.routers.<name>.*). Used as the stable tie-breaker in
 	// precedence ordering.
 	RouterName string
+
+	// ServiceName references a separately modeled named HTTP service. Empty
+	// preserves the legacy implicit service represented by Endpoints.
+	ServiceName string
+	Timeout     *time.Duration
+	IdleTimeout *time.Duration
+	Retry       *RetryPolicy
+	// MiddlewareNames preserves the router label's explicit chain. Middlewares
+	// contains the validated typed definitions in the same execution order.
+	MiddlewareNames []string
+	Middlewares     []Middleware
+	// DiscoveryNetwork records the effective Docker network so replica
+	// definitions with conflicting discovery policy are not silently merged.
+	DiscoveryNetwork string
+
+	// Entrypoints is the list of HTTP entrypoint names this router is served
+	// on, from the .entrypoints label. Entrypoint names are a daemon/operator
+	// configuration (HTTP_ENTRYPOINTS); a label can only select among them,
+	// never bind a new host socket. Empty means the default HTTP/HTTPS
+	// entrypoints (legacy behavior).
+	Entrypoints []string
+	// Tracing carries the per-route tracing hooks (.tracing /
+	// .tracing.operationname). A nil Tracing means the hook is unset: tracing
+	// follows the listener/HCM default.
+	Tracing *TracingConfig
+	// AccessLog, when non-nil, records the .accesslog hook (true|false). It is
+	// carried as route metadata: Envoy access logging is listener-scoped (there
+	// is no per-route access-log field in the pinned API), so this is a
+	// declarative carrier of intent, not a per-route log toggle (see LABELS.md
+	// limitations).
+	AccessLog *bool
+}
+
+// TracingConfig is the per-route tracing configuration parsed from the
+// .tracing and .tracing.operationname router labels.
+type TracingConfig struct {
+	// Enabled is the .tracing hook (true|false). When false the route
+	// disables tracing for its traffic (0% sampling); when true it forces
+	// tracing (100% sampling).
+	Enabled bool
+	// OperationName is the .tracing.operationname hook: the span operation
+	// name for this route (the per-route analog of the route decorator).
+	OperationName string
 }
 
 func (r Route) String() string {

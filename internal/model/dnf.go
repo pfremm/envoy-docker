@@ -209,6 +209,8 @@ func dimension(a Atom) (key, value string) {
 		return "query:" + a.Name, a.Value
 	case KindClientIP:
 		return "clientip", a.Value
+	case KindSNI:
+		return "sni", a.Value
 	default:
 		return "unknown", ""
 	}
@@ -242,6 +244,10 @@ func isContradiction(term DNFTerm) bool {
 // is a prefix of it; for all other dimensions the values must be equal.
 func dimsCompatible(key, a, b string) bool {
 	if a == b {
+		return true
+	}
+	if key == "sni" && (a == "*" || b == "*") {
+		// The SNI catch-all is compatible with any concrete SNI value.
 		return true
 	}
 	if key == "pathprefix" {

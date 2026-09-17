@@ -56,11 +56,16 @@ func run(logger *slog.Logger) error {
 	adsServer := xds.NewServer(logger)
 
 	snapCfg := xds.Config{
-		BaseDomain:         cfg.BaseDomain,
-		HTTPPort:           cfg.HTTPPort,
-		HTTPSPort:          cfg.HTTPSPort,
-		CertSecretName:     cfg.CertSecretName,
-		ACMESDSClusterName: cfg.ACMESDSClusterName,
+		BaseDomain:             cfg.BaseDomain,
+		HTTPPort:               cfg.HTTPPort,
+		HTTPSPort:              cfg.HTTPSPort,
+		CertSecretName:         cfg.CertSecretName,
+		ACMESDSClusterName:     cfg.ACMESDSClusterName,
+		TCPEntrypoints:         cfg.TCPEntrypoints,
+		DefaultTCPEntrypoint:   cfg.DefaultTCPEntrypoint,
+		HTTPEntrypoints:        cfg.HTTPEntrypoints,
+		DefaultHTTPEntrypoint:  cfg.DefaultHTTPEntrypoint,
+		DefaultHTTPEntrypoints: cfg.DefaultHTTPEntrypoints,
 	}
 
 	var infoSrv *infoserver.Server
@@ -71,21 +76,22 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	updates := make(chan map[string]model.Route)
+	updates := make(chan model.Configuration)
 
 	var version atomic.Uint64
 
-	applyUpdate := func(dockerRoutes map[string]model.Route) error {
-		merged := xds.Merge(dockerRoutes, staticRoutes, logger)
+	applyUpdate := func(dockerConfig model.Configuration) error {
+		merged := xds.Merge(dockerConfig.HTTP.Routes, staticRoutes, logger)
+		httpConfig := model.HTTPConfiguration{Routes: merged, Services: dockerConfig.HTTP.Services, Middlewares: dockerConfig.HTTP.Middlewares}
 		v := version.Add(1)
-		snap, err := xds.BuildSnapshot(strconv.FormatUint(v, 10), merged, snapCfg)
+		snap, err := xds.BuildSnapshotForConfigWithTCP(strconv.FormatUint(v, 10), httpConfig, dockerConfig.TCP, snapCfg)
 		if err != nil {
 			return fmt.Errorf("building snapshot: %w", err)
 		}
 		if err := adsServer.SetSnapshot(ctx, snap); err != nil {
 			return fmt.Errorf("publishing snapshot: %w", err)
 		}
-		logger.Info("published snapshot", "version", v, "routes", len(merged))
+		logger.Info("published snapshot", "version", v, "routes", len(merged), "tcp_routers", len(dockerConfig.TCP.Routers))
 
 		if infoSrv != nil {
 			infoSrv.Update(buildInfoView(cfg, merged, strconv.FormatUint(v, 10)))
@@ -96,7 +102,7 @@ func run(logger *slog.Logger) error {
 	// Publish once immediately with just the static routes (if any), so
 	// static-only backends stay routable even if the docker daemon is
 	// unreachable or slow to answer the first scan.
-	if err := applyUpdate(map[string]model.Route{}); err != nil {
+	if err := applyUpdate(model.Configuration{HTTP: model.HTTPConfiguration{Routes: map[string]model.Route{}, Services: map[string]model.HTTPService{}}}); err != nil {
 		logger.Error("failed to publish initial snapshot", "error", err)
 	}
 

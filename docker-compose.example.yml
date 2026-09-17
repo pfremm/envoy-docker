@@ -17,6 +17,15 @@ services:
       CERT_SECRET_NAME: wildcard-cert
       ACME_SDS_CLUSTER_NAME: acme_sds_cluster
       STATIC_CONFIG_PATH: /etc/envoy-control-plane/static-routes.yaml
+      # Optional TCP routing/TLS passthrough: "name=port,name2=port2".
+      # Container labels may only select among these names (see docs/LABELS.md);
+      # they can never bind a new host port of their own.
+      TCP_ENTRYPOINTS: "websecure=8443,db=5432"
+      TCP_DEFAULT_ENTRYPOINT: websecure
+      # Optional extra HTTP/HTTPS entrypoints, same "name=port" shape and the
+      # same never-bind-arbitrary-sockets rule as TCP_ENTRYPOINTS above. The
+      # legacy HTTP_PORT/HTTPS_PORT pair always exists regardless of this.
+      HTTP_ENTRYPOINTS: "admin=8444"
       # Optional read-only HTML page showing discovered/configured routes.
       INFO_ENDPOINT_ENABLED: "true"
       INFO_PORT: "9902"
@@ -32,7 +41,7 @@ services:
     # is normally owned by root/the docker group on the host.
 
   envoy:
-    image: envoyproxy/envoy:v1.31-latest
+    image: envoyproxy/envoy:v1.37-latest
     depends_on:
       - envoy-control-plane
     environment:
@@ -64,6 +73,12 @@ services:
       - "80:80"
       - "443:443"
       - "9901:9901" # admin interface - drop this in production
+      # TCP entrypoints declared above (TCP_ENTRYPOINTS) bind on the Envoy
+      # container; expose the ones you want reachable from the host.
+      - "8443:8443" # websecure TCP entrypoint (TLS passthrough demo below)
+      - "5432:5432" # db TCP entrypoint (raw TCP demo below)
+      # HTTP entrypoints declared above (HTTP_ENTRYPOINTS); same idea.
+      - "8444:8444" # admin HTTP entrypoint (see myapp-admin demo below)
     networks:
       - proxy
 
@@ -83,6 +98,56 @@ services:
       envoy.enable: "true"
       envoy.http.routers.web.subdomain: myapp
       envoy.http.routers.web.port: "80"
+      envoy.http.routers.web.middlewares: local-limit,basic,strip-api,app-prefix,secure-headers
+
+      # Envoy's native basic_auth filter supports {SHA} htpasswd entries.
+      # If an accepted hash contains '$', Compose requires every '$' doubled.
+      envoy.http.middlewares.basic.basicauth.users: "demo:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g="
+      envoy.http.middlewares.basic.basicauth.realm: "demo"
+      envoy.http.middlewares.basic.basicauth.removeheader: "true"
+      envoy.http.middlewares.local-limit.ratelimit.average: "10"
+      envoy.http.middlewares.local-limit.ratelimit.burst: "20"
+      envoy.http.middlewares.local-limit.ratelimit.period: "1s"
+      envoy.http.middlewares.strip-api.stripprefix.prefixes: /api,/v1
+      envoy.http.middlewares.app-prefix.addprefix.prefix: /internal
+      envoy.http.middlewares.secure-headers.headers.response.X-Content-Type-Options: nosniff
+      envoy.http.middlewares.secure-headers.headers.removeresponse: Server
+
+      # Observability hooks: trace this router's traffic with a named span,
+      # and record accesslog=true as route metadata (see docs/LABELS.md;
+      # access logging itself is configured listener-wide in bootstrap.yaml.tmpl).
+      envoy.http.routers.web.tracing: "true"
+      envoy.http.routers.web.tracing.operationname: myapp-ingress
+      envoy.http.routers.web.accesslog: "true"
+    networks:
+      - proxy
+
+  # Same demo app, additionally reachable on the dedicated "admin" HTTP
+  # entrypoint declared above (HTTP_ENTRYPOINTS=admin=8444) as
+  # https://myapp-admin.nas.pfrem.me:8444, alongside the default entrypoint.
+  myapp-admin:
+    image: nginx:alpine
+    labels:
+      envoy.enable: "true"
+      envoy.http.routers.admin.subdomain: myapp-admin
+      envoy.http.routers.admin.port: "80"
+      envoy.http.routers.admin.entrypoints: admin
+    networks:
+      - proxy
+
+  # Demo TCP service: raw TCP on the "db" entrypoint (5432), no TLS
+  # inspection required since the rule is the mandatory catch-all for raw
+  # routers. Reachable at <docker-host>:5432.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: demo
+    labels:
+      envoy.enable: "true"
+      envoy.tcp.routers.postgres.rule: "HostSNI(*)"
+      envoy.tcp.routers.postgres.service: postgres
+      envoy.tcp.routers.postgres.entrypoints: db
+      envoy.tcp.services.postgres.loadbalancer.servers.0.port: "5432"
     networks:
       - proxy
 
