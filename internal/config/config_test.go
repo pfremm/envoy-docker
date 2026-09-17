@@ -36,3 +36,11 @@ func TestLoadRejectsSharedHTTPAndTCPEntrypointPort(t *testing.T) {
 		}
 	})
 }
+
+func TestLoadRejectsDefaultHTTPHTTPSPortCollision(t *testing.T) {
+	withEnv(t, map[string]string{"BASE_DOMAIN": "example.com", "HTTP_PORT": "8443", "HTTPS_PORT": "8443"}, func() {
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "default HTTP and HTTPS") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+}

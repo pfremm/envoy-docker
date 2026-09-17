@@ -315,6 +315,9 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 const defaultEntrypointName = "default"
 
 func validateEntrypointPorts(cfg Config) error {
+	if cfg.HTTPPort == cfg.HTTPSPort {
+		return fmt.Errorf("default HTTP and HTTPS listeners both use port %d", cfg.HTTPPort)
+	}
 	used := map[uint32]string{cfg.HTTPPort: "default HTTP", cfg.HTTPSPort: "default HTTPS"}
 	for name, port := range cfg.HTTPEntrypoints {
 		if prior, ok := used[port]; ok {
