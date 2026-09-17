@@ -66,6 +66,7 @@ func run(logger *slog.Logger) error {
 		HTTPEntrypoints:        cfg.HTTPEntrypoints,
 		DefaultHTTPEntrypoint:  cfg.DefaultHTTPEntrypoint,
 		DefaultHTTPEntrypoints: cfg.DefaultHTTPEntrypoints,
+		Logger:                 logger,
 	}
 
 	var infoSrv *infoserver.Server

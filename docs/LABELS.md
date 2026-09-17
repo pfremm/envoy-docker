@@ -413,11 +413,17 @@ match wins. The control plane orders routes with a deterministic precedence
 
 A rule-based route is served by the virtual host of its rule's first
 `Host(...)` atom. A legacy (no-rule) route keeps its own
-`<subdomain>.<baseDomain>` virtual host. When any rule-based route exists,
-legacy routes are additionally carried in a catch-all virtual host with
-domain `*` so a request that matches no rule-based host still reaches them.
-With no rule-based routes at all, the configuration is exactly the legacy
-shape (one virtual host per subdomain, no catch-all).
+`<subdomain>.<baseDomain>` virtual host **in every configuration**, so legacy
+subdomains stay isolated from each other even when rule-based routes exist.
+When any rule-based route exists, legacy routes are additionally carried in a
+catch-all virtual host with domain `*`; each catch-all copy is constrained to
+its own `<subdomain>.<baseDomain>` authority, so a request that matches no
+rule-based host still reaches *its own* legacy route, while a request for an
+entirely unknown host matches nothing (404) instead of being routed to an
+arbitrary legacy backend. A legacy route whose host is also claimed by a
+rule-based virtual host joins that virtual host and is ordered by the shared
+precedence rules above. With no rule-based routes at all, the configuration
+is exactly the legacy shape (one virtual host per subdomain, no catch-all).
 
 ## Static YAML config
 
@@ -462,8 +468,12 @@ extra configured entrypoint gets its own TLS listener (`https_listener__<ep>`)
 on its configured port, serving its own RDS route configuration
 (`https_routes__<ep>`); a router naming multiple entrypoints is published,
 unmodified, on every one of them. A router naming an entrypoint the daemon
-did not configure is rejected with the list of valid names, exactly like the
-TCP case.
+did not configure is skipped on that entrypoint with a warning naming the
+valid entrypoints (it still publishes on any valid entrypoints it also
+names), exactly like the TCP case: labels are untrusted input, so one bad
+`.entrypoints` value never blocks config updates for other containers. The
+default `https_routes` route configuration is always published — even with
+zero routes — because the default `https_listener` always references it.
 
 Unlike TCP entrypoints (which carry either a raw or TLS-passthrough chain and
 never terminate TLS), every HTTP entrypoint listener — default or named — is
@@ -615,9 +625,11 @@ already configured (via `TCP_ENTRYPOINTS=name=port,name2=port2` and,
 optionally, `TCP_DEFAULT_ENTRYPOINT=name` in the control plane's own
 environment); a container label can never bind a new host socket of its
 own. A router with no `.entrypoints` label uses `TCP_DEFAULT_ENTRYPOINT`
-when set; otherwise it is rejected (an explicit entrypoint is required). A
-router naming an entrypoint that was not configured is rejected with the
-list of valid names. Comma-separated multiple entrypoints publish the same
+when set; otherwise it is skipped with a warning (an explicit entrypoint is
+required). A router naming an entrypoint that was not configured is skipped
+with a warning naming the list of valid entrypoints; labels are untrusted
+input, so a bad selection never blocks config updates for other containers.
+Comma-separated multiple entrypoints publish the same
 router's filter chain on every named listener. Existing HTTP/HTTPS
 entrypoints (`HTTP_PORT`/`HTTPS_PORT`) are untouched by any of this and
 keep serving legacy HTTP routers exactly as before.
@@ -657,25 +669,23 @@ first, then rule specificity (the length of the rule expression,
 descending), then router name (ascending) as the final tie-breaker.
 
 Because Envoy's `FilterChainMatch` has no priority concept of its own — it
-picks the single best-matching chain, and two chains that could both claim
-the same connection with no way to prefer one is a configuration error, not
-something map iteration should silently arbitrate — this control plane
-detects ambiguous overlaps deterministically at build time rather than
-depending on which chain a map walk happens to emit first:
+picks the single best-matching chain **structurally**, and two chains with
+identical or overlapping matches are duplicates Envoy rejects with an LDS
+NACK (refusing the entire listener update) — this control plane resolves
+overlaps deterministically at build time rather than letting a bad label
+NACK the dataplane:
 
 - Two routers on the same entrypoint, same TLS mode (raw vs. passthrough),
-  in the **same precedence tier** (both with no explicit priority, or both
-  with the identical explicit priority value), whose `HostSNI(...)` sets
-  overlap (either both are the catch-all, or they share a concrete SNI
-  value) are rejected with an actionable error naming both routers, the
-  entrypoint, and the overlapping values.
+  whose `HostSNI(...)` sets overlap (either both are the catch-all, or they
+  share a concrete SNI value) cannot coexist as Envoy filter chains,
+  **regardless of `.priority`** — priority orders chains but cannot
+  disambiguate structural duplicate matches. The highest-precedence router
+  of the overlapping set is kept and the rest are skipped with a warning
+  naming both routers and the overlapping values.
 - A concrete SNI match and the catch-all on the same entrypoint/TLS-mode
   are **not** a conflict: Envoy's filter-chain matching always prefers the
   more specific (concrete `server_names`) chain over the fallback, so no
   priority is needed to arbitrate that case.
-- Distinct explicit priorities are never a conflict, regardless of SNI
-  overlap: the higher priority's chain is ordered first, exactly mirroring
-  HTTP `.priority`.
 - Raw and passthrough chains on the same entrypoint never conflict with
   each other: they match mutually exclusive `transport_protocol` values
   (`raw_buffer` vs. `tls`) at the Envoy filter-chain level.
@@ -764,7 +774,7 @@ features documented elsewhere in this file) are supported.
 | Traefik label | This control plane | Notes |
 | --- | --- | --- |
 | `traefik.enable=true` | `envoy.enable=true` | Same semantics: opt-in per container. |
-| `traefik.http.routers.<r>.rule=Host(\`app.example.com\`)` | `envoy.http.routers.<r>.rule=Host(app.example.com)` | No backticks around the value; this grammar's `Host(...)` takes a bare hostname. Traefik's `Host()`/`Headers()`/etc. all lower/uppercase quoting rules do not apply here — see [Matchers](#matchers). |
+| `traefik.http.routers.<r>.rule=Host(\`app.example.com\`)` | `envoy.http.routers.<r>.rule=Host(app.example.com)` | No backticks around the value; this grammar's `Host(...)` takes a bare hostname, and a backticked value is rejected with an actionable error (never silently accepted) so a pasted Traefik rule cannot silently blackhole a router. Traefik's `Host()`/`Headers()`/etc. all lower/uppercase quoting rules do not apply here — see [Matchers](#matchers). |
 | `traefik.http.routers.<r>.rule=PathPrefix(\`/api\`)` | `envoy.http.routers.<r>.rule=PathPrefix(/api)` | Same idea; combine with `Host(...)` via `&&` as shown throughout this doc. |
 | `traefik.http.routers.<r>.priority=10` | `envoy.http.routers.<r>.priority=10` | Same integer-priority override semantics; both fall back to rule-specificity ordering when unset. |
 | `traefik.http.routers.<r>.entrypoints=websecure` | `envoy.http.routers.<r>.entrypoints=websecure` | Same idea (comma-separated selection among *daemon-configured* entrypoints), but Traefik entrypoints are typically declared in its static config file, while here they come from `HTTP_ENTRYPOINTS`/`TCP_ENTRYPOINTS` environment variables. See [HTTP entrypoints](#http-entrypoints) / [TCP entrypoints](#tcp-entrypoints). |

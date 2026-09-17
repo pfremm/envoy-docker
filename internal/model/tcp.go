@@ -232,10 +232,12 @@ func SortTCPRoutersByPrecedence(routers []TCPRouter) []TCPRouter {
 }
 
 // samePriorityTier reports whether two TCP routers are in the same
-// precedence tier for conflict-detection purposes: both explicit with an
-// equal numeric priority, or both implicit (no explicit priority at all).
-// A router with an explicit priority never ties with one without, mirroring
-// tier 1 of TCPPrecedence.
+// precedence tier: both explicit with an equal numeric priority, or both
+// implicit (no explicit priority at all). A router with an explicit
+// priority never ties with one without, mirroring tier 1 of TCPPrecedence.
+// Note: priority tiers deliberately play NO role in conflict detection —
+// Envoy filter-chain matching is structural, so overlapping SNI matches are
+// duplicates regardless of priority (see DetectTCPConflicts).
 func samePriorityTier(a, b TCPRouter) bool {
 	if a.PrioritySet != b.PrioritySet {
 		return false
@@ -252,8 +254,8 @@ func samePriorityTier(a, b TCPRouter) bool {
 // "everything else" chain per entrypoint+TLS-mode), or their concrete SNI
 // value sets intersect (Envoy's FilterChainMatch has no priority concept,
 // so two chains matching the identical server name is a duplicate match
-// Envoy itself would reject). Different TLS modes never overlap: passthrough
-// chains match transport_protocol "tls" and raw chains match
+// Envoy itself rejects with an LDS NACK). Different TLS modes never overlap:
+// passthrough chains match transport_protocol "tls" and raw chains match
 // transport_protocol "raw_buffer", so they are already mutually exclusive at
 // the Envoy filter-chain-match level. A catch-all against a concrete value
 // (within the same mode) is NOT an overlap: Envoy's filter-chain matching
@@ -286,14 +288,27 @@ func sniOverlap(a, b TCPRouter) bool {
 	return false
 }
 
+// TCPFilterChainOverlap reports whether two TCP routers on the same
+// entrypoint would emit Envoy filter chains with overlapping (ambiguous or
+// byte-identical) FilterChainMatch entries. Filter-chain matching is
+// structural, not ordered: Envoy rejects a listener containing duplicate
+// matches with an LDS NACK regardless of chain order or router priority, so
+// explicit .priority values can NOT disambiguate overlapping SNI sets.
+func TCPFilterChainOverlap(a, b TCPRouter) bool {
+	return sniOverlap(a, b)
+}
+
 // DetectTCPConflicts returns a deterministic, actionable error if any two
-// routers among the given set (already known to share one entrypoint and TLS
-// mode) are in the same precedence tier (see samePriorityTier) with
-// overlapping SNI match domains (see sniOverlap): Envoy's filter-chain
-// matching would then have no principled way to prefer one over the other,
-// and which one an implementation picks must not depend on map iteration
-// order. Routers are compared in a name-sorted order so the reported pair
-// (and thus the error message) is itself deterministic across runs.
+// routers among the given set (already known to share one entrypoint) have
+// overlapping SNI match domains within the same TLS mode (see sniOverlap).
+// Envoy's filter-chain matching is structural with no priority concept:
+// chains with identical or intersecting server_names are duplicate matches
+// that Envoy rejects with an LDS NACK — an NACK refuses the ENTIRE listener
+// update, so this must be caught at build time. Explicit .priority values do
+// not (and cannot) disambiguate overlapping matches; they only order
+// non-conflicting chains. Routers are compared in a name-sorted order so the
+// reported pair (and thus the error message) is itself deterministic across
+// runs.
 func DetectTCPConflicts(routers []TCPRouter, entrypoint string) error {
 	sorted := make([]TCPRouter, len(routers))
 	copy(sorted, routers)
@@ -301,20 +316,13 @@ func DetectTCPConflicts(routers []TCPRouter, entrypoint string) error {
 	for i := 0; i < len(sorted); i++ {
 		for j := i + 1; j < len(sorted); j++ {
 			a, b := sorted[i], sorted[j]
-			if !samePriorityTier(a, b) {
-				continue
-			}
 			if !sniOverlap(a, b) {
 				continue
 			}
-			tier := "no explicit priority"
-			if a.PrioritySet {
-				tier = fmt.Sprintf("priority %d", a.Priority)
-			}
 			return fmt.Errorf(
-				"ambiguous TCP routers %q and %q on entrypoint %q: both have %s and overlapping SNI match (%v vs %v); "+
-					"set distinct .priority values or make their HostSNI(...) rules non-overlapping",
-				a.Name, b.Name, entrypoint, tier, a.SNIValues(), b.SNIValues())
+				"ambiguous TCP routers %q and %q on entrypoint %q: overlapping SNI match (%v vs %v) would produce duplicate Envoy filter-chain matches (rejected with an LDS NACK regardless of .priority); "+
+					"make their HostSNI(...) rules non-overlapping",
+				a.Name, b.Name, entrypoint, a.SNIValues(), b.SNIValues())
 		}
 	}
 	return nil

@@ -158,7 +158,9 @@ func TestBuildTCP_MultipleEntrypointsProduceMultipleListeners(t *testing.T) {
 	}
 }
 
-func TestBuildTCP_UnknownEntrypointRejected(t *testing.T) {
+func TestBuildTCP_UnknownEntrypointSkipsRouter(t *testing.T) {
+	// A label-derived unknown entrypoint must not wedge the snapshot: the
+	// router is skipped with a warning and no TCP listener is emitted.
 	tcpCfg := model.TCPConfiguration{
 		Routers: map[string]model.TCPRouter{
 			"r": {Name: "r", Rule: hostSNI("*"), RuleExpr: "HostSNI(*)", ServiceName: "svc", Entrypoints: []string{"doesnotexist"}},
@@ -167,13 +169,20 @@ func TestBuildTCP_UnknownEntrypointRejected(t *testing.T) {
 			"svc": {Name: "svc", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 1}}},
 		},
 	}
-	_, err := BuildSnapshotForConfigWithTCP("1", model.HTTPConfiguration{}, tcpCfg, baseTCPCfg())
-	if err == nil || !strings.Contains(err.Error(), "unknown entrypoint") {
-		t.Fatalf("expected unknown entrypoint rejection, got %v", err)
+	snap, err := BuildSnapshotForConfigWithTCP("1", model.HTTPConfiguration{}, tcpCfg, baseTCPCfg())
+	if err != nil {
+		t.Fatalf("unknown entrypoint must not fail the snapshot: %v", err)
+	}
+	for name := range snap.GetResources(resourcev3.ListenerType) {
+		if strings.HasPrefix(name, tcpListenerNamePrefix) {
+			t.Fatalf("no TCP listener should be emitted for a skipped router, got %q", name)
+		}
 	}
 }
 
-func TestBuildTCP_NoEntrypointsNoDefaultRejected(t *testing.T) {
+func TestBuildTCP_NoEntrypointsNoDefaultSkipsRouter(t *testing.T) {
+	// No .entrypoints and no configured default: the router is skipped
+	// with a warning instead of wedging the snapshot.
 	tcpCfg := model.TCPConfiguration{
 		Routers: map[string]model.TCPRouter{
 			"r": {Name: "r", Rule: hostSNI("*"), RuleExpr: "HostSNI(*)", ServiceName: "svc"},
@@ -184,13 +193,23 @@ func TestBuildTCP_NoEntrypointsNoDefaultRejected(t *testing.T) {
 	}
 	cfg := baseTCPCfg()
 	cfg.DefaultTCPEntrypoint = ""
-	_, err := BuildSnapshotForConfigWithTCP("1", model.HTTPConfiguration{}, tcpCfg, cfg)
-	if err == nil || !strings.Contains(err.Error(), "no default TCP entrypoint") {
-		t.Fatalf("expected no-default rejection, got %v", err)
+	snap, err := BuildSnapshotForConfigWithTCP("1", model.HTTPConfiguration{}, tcpCfg, cfg)
+	if err != nil {
+		t.Fatalf("missing default entrypoint must not fail the snapshot: %v", err)
+	}
+	for name := range snap.GetResources(resourcev3.ListenerType) {
+		if strings.HasPrefix(name, tcpListenerNamePrefix) {
+			t.Fatalf("no TCP listener should be emitted for a skipped router, got %q", name)
+		}
 	}
 }
 
-func TestBuildTCP_PriorityConflictRejected(t *testing.T) {
+func TestBuildTCP_SamePriorityConflictKeepsDeterministicWinner(t *testing.T) {
+	// Two same-tier routers with identical SNI would emit duplicate
+	// FilterChainMatch entries (Envoy LDS NACK). The build keeps the
+	// highest-precedence router (name-sorted tie-break: "a") and skips the
+	// other with a warning, so one conflicting label never wedges the
+	// snapshot.
 	tcpCfg := model.TCPConfiguration{
 		Routers: map[string]model.TCPRouter{
 			"a": {Name: "a", Rule: hostSNI("dup.com"), RuleExpr: "HostSNI(dup.com)", ServiceName: "svc", TLSPassthrough: true, Entrypoints: []string{"websecure"}},
@@ -200,13 +219,24 @@ func TestBuildTCP_PriorityConflictRejected(t *testing.T) {
 			"svc": {Name: "svc", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 1}}},
 		},
 	}
-	_, err := BuildSnapshotForConfigWithTCP("1", model.HTTPConfiguration{}, tcpCfg, baseTCPCfg())
-	if err == nil || !strings.Contains(err.Error(), "ambiguous TCP routers") {
-		t.Fatalf("expected ambiguous conflict rejection, got %v", err)
+	snap, err := BuildSnapshotForConfigWithTCP("1", model.HTTPConfiguration{}, tcpCfg, baseTCPCfg())
+	if err != nil {
+		t.Fatalf("overlapping SNI must not fail the snapshot: %v", err)
+	}
+	l := snap.GetResources(resourcev3.ListenerType)[tcpListenerNamePrefix+"websecure"].(*listenerv3.Listener)
+	if len(l.FilterChains) != 1 {
+		t.Fatalf("expected exactly 1 surviving filter chain (no duplicate FilterChainMatch), got %d", len(l.FilterChains))
+	}
+	if l.FilterChains[0].Name != "tcp_router__a" {
+		t.Fatalf("expected deterministic winner 'a', got %+v", l.FilterChains)
 	}
 }
 
-func TestBuildTCP_ExplicitPriorityAvoidsConflict(t *testing.T) {
+func TestBuildTCP_ExplicitPriorityDoesNotBypassOverlapDedup(t *testing.T) {
+	// Distinct priorities cannot make identical SNI matches coexist:
+	// FilterChainMatch has no priority concept and Envoy NACKs duplicate
+	// matches. The higher-priority router's chain survives; the other is
+	// skipped.
 	tcpCfg := model.TCPConfiguration{
 		Routers: map[string]model.TCPRouter{
 			"a": {Name: "a", Rule: hostSNI("dup.com"), RuleExpr: "HostSNI(dup.com)", ServiceName: "svc", TLSPassthrough: true, Entrypoints: []string{"websecure"}, Priority: 10, PrioritySet: true},
@@ -218,15 +248,15 @@ func TestBuildTCP_ExplicitPriorityAvoidsConflict(t *testing.T) {
 	}
 	snap, err := BuildSnapshotForConfigWithTCP("1", model.HTTPConfiguration{}, tcpCfg, baseTCPCfg())
 	if err != nil {
-		t.Fatalf("distinct priorities should not conflict: %v", err)
+		t.Fatalf("overlapping SNI with distinct priorities must not fail the snapshot: %v", err)
 	}
 	l := snap.GetResources(resourcev3.ListenerType)[tcpListenerNamePrefix+"websecure"].(*listenerv3.Listener)
-	if len(l.FilterChains) != 2 {
-		t.Fatalf("expected 2 filter chains, got %d", len(l.FilterChains))
+	if len(l.FilterChains) != 1 {
+		t.Fatalf("expected 1 surviving filter chain (duplicate FilterChainMatch deduped), got %d", len(l.FilterChains))
 	}
-	// Higher priority ("a") must be ordered first.
+	// Higher priority ("a") must be the survivor.
 	if l.FilterChains[0].Name != "tcp_router__a" {
-		t.Fatalf("expected higher-priority router 'a' first, got %+v", l.FilterChains)
+		t.Fatalf("expected higher-priority router 'a' to survive, got %+v", l.FilterChains)
 	}
 }
 

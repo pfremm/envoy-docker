@@ -7,6 +7,7 @@ package xds
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -28,11 +29,13 @@ const tcpListenerNamePrefix = "tcp_listener__"
 
 // buildTCPResources validates a TCPConfiguration against the configured
 // static entrypoints and turns it into one Envoy listener per entrypoint
-// (each carrying one filter chain per router, ordered by precedence with
-// deterministic conflict detection) plus the named TCP service clusters and
-// endpoints they reference. It never emits an HTTP connection manager: raw
-// and passthrough filter chains carry only a tcp_proxy network filter.
-func buildTCPResources(tcpCfg model.TCPConfiguration, cfg Config) (listeners []cachetypes.Resource, clusters []cachetypes.Resource, endpoints []cachetypes.Resource, err error) {
+// (each carrying one filter chain per surviving router, ordered by
+// precedence, with label-derived problems — unknown entrypoints,
+// overlapping SNI matches — degraded to deterministic per-router skips)
+// plus the named TCP service clusters and endpoints they reference. It
+// never emits an HTTP connection manager: raw and passthrough filter chains
+// carry only a tcp_proxy network filter.
+func buildTCPResources(tcpCfg model.TCPConfiguration, cfg Config, logger *slog.Logger) (listeners []cachetypes.Resource, clusters []cachetypes.Resource, endpoints []cachetypes.Resource, err error) {
 	if len(tcpCfg.Routers) == 0 {
 		return nil, nil, nil, nil
 	}
@@ -63,22 +66,31 @@ func buildTCPResources(tcpCfg model.TCPConfiguration, cfg Config) (listeners []c
 
 	// Resolve each router's effective entrypoint list (explicit, or the
 	// configured default) and group by entrypoint. A router naming an
-	// entrypoint the daemon did not configure is rejected: entrypoint
+	// entrypoint the daemon did not configure — or naming none when no
+	// default is configured — is skipped with a warning: entrypoint
 	// addresses/ports are operator configuration, so a label can only
-	// SELECT among them, never conjure a new bound socket.
+	// SELECT among them, never conjure a new bound socket, and a bad
+	// label-derived selection must never wedge the whole snapshot.
 	byEntrypoint := map[string][]model.TCPRouter{}
 	for _, name := range routerNames {
 		r := tcpCfg.Routers[name]
 		eps := r.Entrypoints
 		if len(eps) == 0 {
 			if cfg.DefaultTCPEntrypoint == "" {
-				return nil, nil, nil, fmt.Errorf("tcp router %q sets no .entrypoints and no default TCP entrypoint is configured", name)
+				if logger != nil {
+					logger.Warn("skipping tcp router: no .entrypoints and no default TCP entrypoint configured", "router", name)
+				}
+				continue
 			}
 			eps = []string{cfg.DefaultTCPEntrypoint}
 		}
 		for _, ep := range eps {
 			if _, ok := cfg.TCPEntrypoints[ep]; !ok {
-				return nil, nil, nil, fmt.Errorf("tcp router %q references unknown entrypoint %q (configured entrypoints: %v)", name, ep, sortedEntrypointNames(cfg.TCPEntrypoints))
+				if logger != nil {
+					logger.Warn("skipping tcp router on unknown entrypoint",
+						"router", name, "entrypoint", ep, "configured_entrypoints", sortedEntrypointNames(cfg.TCPEntrypoints))
+				}
+				continue
 			}
 			byEntrypoint[ep] = append(byEntrypoint[ep], r)
 		}
@@ -93,10 +105,35 @@ func buildTCPResources(tcpCfg model.TCPConfiguration, cfg Config) (listeners []c
 	clusterNames := map[string]string{}
 	for _, ep := range entrypointNames {
 		routers := byEntrypoint[ep]
-		if err := model.DetectTCPConflicts(routers, ep); err != nil {
-			return nil, nil, nil, err
+		// Envoy filter-chain matching is structural: two chains with
+		// overlapping server_names (or two catch-alls) in the same TLS
+		// mode are duplicate matches Envoy rejects with an LDS NACK,
+		// regardless of chain order or router .priority — and a NACK
+		// refuses the entire listener update. Keep the highest-precedence
+		// router of each overlapping set and skip the rest with a warning
+		// (deterministic: precedence order), so one conflicting label
+		// never wedges the snapshot.
+		ordered := make([]model.TCPRouter, 0, len(routers))
+		for _, r := range model.SortTCPRoutersByPrecedence(routers) {
+			conflicted := false
+			for _, kept := range ordered {
+				if model.TCPFilterChainOverlap(kept, r) {
+					if logger != nil {
+						logger.Warn("skipping tcp router: overlapping SNI match would produce a duplicate Envoy filter-chain match",
+							"entrypoint", ep, "skipped", r.Name, "kept", kept.Name,
+							"skipped_sni", r.SNIValues(), "kept_sni", kept.SNIValues())
+					}
+					conflicted = true
+					break
+				}
+			}
+			if !conflicted {
+				ordered = append(ordered, r)
+			}
 		}
-		ordered := model.SortTCPRoutersByPrecedence(routers)
+		if len(ordered) == 0 {
+			continue
+		}
 
 		listener, err := buildTCPListener(ep, cfg.TCPEntrypoints[ep], ordered, tcpCfg)
 		if err != nil {

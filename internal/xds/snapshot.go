@@ -77,6 +77,15 @@ type Config struct {
 	// DefaultHTTPEntrypoints is the ordered default list. The singular field
 	// is retained for compatibility with existing callers.
 	DefaultHTTPEntrypoints []string
+
+	// Logger, when non-nil, receives warnings for label-derived problems
+	// that are handled by skipping the offending router (unknown
+	// entrypoint names, overlapping TCP filter-chain matches,
+	// untranslatable rules). Label-derived input is untrusted, so such
+	// problems never fail the whole snapshot: one bad container label must
+	// not wedge config updates for every other container. A nil Logger
+	// skips silently.
+	Logger *slog.Logger
 }
 
 // Merge combines docker-derived and static routes into one map keyed by
@@ -128,13 +137,16 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 	// legacy HTTP/HTTPS pair) always exists and carries every router that
 	// sets no .entrypoints label; each configured extra entrypoint carries
 	// only the routers that explicitly select it. A router selecting an
-	// entrypoint the daemon did not configure is rejected: entrypoint
-	// addresses/ports are operator configuration, so a label can only
-	// SELECT among them, never conjure a new bound socket.
-	byEntrypoint, entrypointNames, err := groupRoutesByEntrypoint(routes, cfg)
-	if err != nil {
-		return nil, err
+	// entrypoint the daemon did not configure is skipped on that entrypoint
+	// with a warning: entrypoint addresses/ports are operator
+	// configuration, so a label can only SELECT among them, never conjure
+	// a new bound socket — and an invalid selection must not wedge the
+	// whole snapshot.
+	if logger == nil {
+		logger = cfg.Logger
 	}
+	routes = dedupeRouteNames(routes, logger)
+	byEntrypoint, entrypointNames := groupRoutesByEntrypoint(routes, cfg, logger)
 
 	// One RDS route configuration per entrypoint. The default entrypoint
 	// keeps the legacy resource name (https_routes); extra entrypoints get
@@ -275,7 +287,7 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 			cfg.CertSecretName, cfg.ACMESDSClusterName, plan))
 	}
 
-	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg)
+	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg, logger)
 	if err != nil {
 		return nil, fmt.Errorf("building tcp resources: %w", err)
 	}
@@ -344,9 +356,18 @@ func validateEntrypointPorts(cfg Config) error {
 // groupRoutesByEntrypoint resolves each route's effective HTTP entrypoint
 // list (explicit .entrypoints, or the configured default, or the implicit
 // default entrypoint) and groups the routes by entrypoint. A route selecting
-// an entrypoint the daemon did not configure is rejected. The returned
-// entrypointNames is sorted and always includes the default entrypoint.
-func groupRoutesByEntrypoint(routes map[string]model.Route, cfg Config) (map[string]map[string]model.Route, []string, error) {
+// an entrypoint the daemon did not configure is skipped for that entrypoint
+// with a warning (label-derived input must never fail the whole snapshot —
+// one bad container label must not wedge config updates for every other
+// container); it is still served on any valid entrypoints it also names.
+// The returned entrypointNames is sorted and always includes the default
+// entrypoint, even when it carries no routes: the default https_listener is
+// always published and references the default route configuration by name,
+// so that RDS resource must always exist (an Envoy listener whose Rds
+// resource is absent from the snapshot would warm forever, and a route
+// configuration that disappears from a later snapshot is not withdrawn by
+// SOTW RDS, leaving stale routes behind).
+func groupRoutesByEntrypoint(routes map[string]model.Route, cfg Config, logger *slog.Logger) (map[string]map[string]model.Route, []string) {
 	byEntrypoint := map[string]map[string]model.Route{defaultEntrypointName: {}}
 	for _, name := range sortedSubdomains(routes) {
 		route := routes[name]
@@ -363,7 +384,12 @@ func groupRoutesByEntrypoint(routes map[string]model.Route, cfg Config) (map[str
 		for _, ep := range eps {
 			if ep != defaultEntrypointName {
 				if _, ok := cfg.HTTPEntrypoints[ep]; !ok {
-					return nil, nil, fmt.Errorf("http router %q references unknown entrypoint %q (configured entrypoints: %v)", name, ep, sortedEntrypointNames(cfg.HTTPEntrypoints))
+					if logger != nil {
+						logger.Warn("skipping router on unknown entrypoint",
+							"router", route.RouterName, "subdomain", name, "origin", route.Origin,
+							"entrypoint", ep, "configured_entrypoints", sortedEntrypointNames(cfg.HTTPEntrypoints))
+					}
+					continue
 				}
 			}
 			if byEntrypoint[ep] == nil {
@@ -374,16 +400,46 @@ func groupRoutesByEntrypoint(routes map[string]model.Route, cfg Config) (map[str
 	}
 	names := make([]string, 0, len(byEntrypoint))
 	for ep := range byEntrypoint {
-		if len(byEntrypoint[ep]) == 0 {
-			// The default entrypoint is always present in the map (so a
-			// router can explicitly select it), but it only earns a route
-			// config and listener when a route is actually served on it.
+		if len(byEntrypoint[ep]) == 0 && ep != defaultEntrypointName {
+			// An extra entrypoint only earns a route config and listener
+			// when a route is actually served on it. The default
+			// entrypoint is ALWAYS emitted (see doc comment above): its
+			// listener is unconditional, so its RDS resource must be too.
 			continue
 		}
 		names = append(names, ep)
 	}
 	sort.Strings(names)
-	return byEntrypoint, names, nil
+	return byEntrypoint, names
+}
+
+// dedupeRouteNames enforces global uniqueness of xDS route resource names
+// (routeResourceName: the router label name, or the subdomain when unnamed)
+// across the whole route map. Router names are per-container label
+// namespaces, so two unrelated compose stacks both calling their router
+// "web" is common; letting the collision reach the byRouteName check would
+// reject the WHOLE snapshot and wedge every future update (the discovery
+// layer has the same guard, this one also covers the static-config path).
+// The first claimant in sorted-subdomain order wins (deterministic); later
+// routers are skipped with a warning.
+func dedupeRouteNames(routes map[string]model.Route, logger *slog.Logger) map[string]model.Route {
+	byName := map[string]string{}
+	out := make(map[string]model.Route, len(routes))
+	for _, subdomain := range sortedSubdomains(routes) {
+		route := routes[subdomain]
+		name := routeResourceName(route)
+		if prior, exists := byName[name]; exists {
+			if logger != nil {
+				logger.Warn("skipping router: duplicate router name across containers",
+					"router", name, "subdomain", subdomain, "origin", route.Origin,
+					"claimed_by_subdomain", prior)
+			}
+			continue
+		}
+		byName[name] = subdomain
+		out[subdomain] = route
+	}
+	return out
 }
 
 // redirectRouteClusters rewrites RouteAction.Cluster for every route whose
@@ -459,12 +515,15 @@ func buildClusterLoadAssignment(route model.Route) *endpointv3.ClusterLoadAssign
 // router name), because Envoy evaluates routes top-to-bottom and the first
 // match wins.
 //
-// When any rule-based route exists, a final catch-all virtual host with
-// domain "*" carries the legacy subdomain routes, so a request that matches
-// no rule-based virtual host still reaches the legacy catch-all routes.
-// Without rule-based routes the configuration is exactly the legacy shape
-// (one virtual host per subdomain, no catch-all), preserving backward
-// compatibility.
+// When any rule-based route exists, every legacy route still keeps its own
+// exact-domain virtual host (restoring host isolation between legacy
+// subdomains: Envoy always prefers an exact domain match over the "*"
+// fallback), and a final catch-all virtual host with domain "*"
+// additionally carries the legacy subdomain routes, so a request that
+// matches no virtual host at all still reaches the legacy catch-all routes
+// (the documented additive-catch-all behavior). Without rule-based routes
+// the configuration is exactly the legacy shape (one virtual host per
+// subdomain, no catch-all), preserving backward compatibility.
 func buildHTTPSRouteConfiguration(routes map[string]model.Route, names []string, baseDomain string, logger *slog.Logger) *routev3.RouteConfiguration {
 	byHost := map[string][]model.Route{}
 	var legacy []model.Route
@@ -482,6 +541,21 @@ func buildHTTPSRouteConfiguration(routes map[string]model.Route, names []string,
 		byHost[host] = append(byHost[host], route)
 	}
 
+	// A legacy route whose <subdomain>.<baseDomain> host is ALSO claimed by
+	// a rule-based virtual host joins that virtual host (arbitrated by the
+	// shared precedence order) instead of creating a second virtual host
+	// with a duplicate domain, which Envoy rejects at the RDS layer.
+	remaining := legacy[:0]
+	for _, route := range legacy {
+		host := subdomainHost(route, baseDomain)
+		if _, shared := byHost[host]; shared {
+			byHost[host] = append(byHost[host], route)
+			continue
+		}
+		remaining = append(remaining, route)
+	}
+	legacy = remaining
+
 	vhosts := make([]*routev3.VirtualHost, 0, len(byHost)+1+len(legacy))
 	hostNames := make([]string, 0, len(byHost))
 	for h := range byHost {
@@ -495,22 +569,30 @@ func buildHTTPSRouteConfiguration(routes map[string]model.Route, names []string,
 		}
 	}
 
-	if len(byHost) > 0 {
-		// Legacy subdomain routes move into the catch-all virtual host so
-		// they are evaluated after every rule-based virtual host.
-		catchAll := buildVirtualHost(catchAllDomain, model.SortByPrecedence(legacy), logger)
-		if catchAll != nil {
-			catchAll.Name = catchAllVHName
-			vhosts = append(vhosts, catchAll)
+	// Legacy shape in every configuration: one exact-domain virtual host
+	// per legacy subdomain. This must hold even when rule-based routes
+	// exist — a legacy route emitted ONLY into the "*" catch-all would be
+	// an unconstrained prefix-/ route with no host discrimination, so the
+	// first legacy route would capture traffic for every sibling legacy
+	// subdomain (cross-host traffic bleed).
+	for _, route := range legacy {
+		vh := buildVirtualHost(subdomainHost(route, baseDomain), []model.Route{route}, logger)
+		if vh != nil {
+			vhosts = append(vhosts, vh)
 		}
-	} else {
-		// No rule-based routes: the legacy shape, one virtual host per
-		// subdomain, each with its catch-all route.
-		for _, route := range legacy {
-			vh := buildVirtualHost(subdomainHost(route, baseDomain), []model.Route{route}, logger)
-			if vh != nil {
-				vhosts = append(vhosts, vh)
-			}
+	}
+
+	if len(byHost) > 0 {
+		// Additionally carry the legacy routes in the catch-all virtual
+		// host, evaluated only for hosts no exact-domain virtual host
+		// claimed (Envoy prefers exact domains over "*"). Each copy is
+		// constrained to its own host via an :authority matcher: an
+		// unconstrained prefix-/ copy would let the first legacy route
+		// capture EVERY unmatched host (scanners, wrong DNS, sibling
+		// hosts), which is a cross-host traffic bleed, not a fallback.
+		catchAll := buildLegacyCatchAllVirtualHost(legacy, baseDomain, logger)
+		if catchAll != nil {
+			vhosts = append(vhosts, catchAll)
 		}
 	}
 
@@ -532,6 +614,51 @@ const (
 // <subdomain>.<baseDomain>.
 func subdomainHost(route model.Route, baseDomain string) string {
 	return route.Subdomain + "." + baseDomain
+}
+
+// buildLegacyCatchAllVirtualHost builds the "*" catch-all virtual host that
+// additionally carries the legacy routes when rule-based routes exist. Each
+// legacy route's copy is constrained to its own <subdomain>.<baseDomain>
+// authority (case-insensitive, port-tolerant): the catch-all exists so a
+// request whose Host no rule-based virtual host claimed still reaches its
+// legacy route, NOT so the first legacy route swallows every unknown host.
+func buildLegacyCatchAllVirtualHost(legacy []model.Route, baseDomain string, logger *slog.Logger) *routev3.VirtualHost {
+	var vhRoutes []*routev3.Route
+	for _, route := range model.SortByPrecedence(legacy) {
+		generated := buildRoutesForRoute(route, logger)
+		if generated == nil {
+			continue
+		}
+		host := subdomainHost(route, baseDomain)
+		for _, er := range generated {
+			if er.Match == nil {
+				er.Match = &routev3.RouteMatch{}
+			}
+			er.Match.Headers = append(er.Match.Headers, &routev3.HeaderMatcher{
+				Name: ":authority",
+				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
+					StringMatch: &matcher.StringMatcher{
+						// Exact, case-insensitive :authority match on the
+						// route's own legacy host. A request for an
+						// entirely unknown host therefore matches NO route
+						// (clean 404) instead of being routed to the first
+						// legacy backend.
+						MatchPattern: &matcher.StringMatcher_Exact{Exact: host},
+						IgnoreCase:   true,
+					},
+				},
+			})
+		}
+		vhRoutes = append(vhRoutes, generated...)
+	}
+	if len(vhRoutes) == 0 {
+		return nil
+	}
+	return &routev3.VirtualHost{
+		Name:    catchAllVHName,
+		Domains: []string{catchAllDomain},
+		Routes:  vhRoutes,
+	}
 }
 
 // buildVirtualHost builds one Envoy virtual host. Its routes are the given

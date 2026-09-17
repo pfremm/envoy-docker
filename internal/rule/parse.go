@@ -343,6 +343,15 @@ func (p *parser) parseArg() (string, error) {
 	if val == "" {
 		return "", fmt.Errorf("empty value inside a matcher at position %d", start)
 	}
+	// Reject Traefik-style backticked values (Host(`app.example.com`))
+	// with an actionable error. Accepting them silently would keep the
+	// backticks INSIDE the value: the resulting virtual-host domain
+	// "`app.example.com`" can never equal a real :authority, so the router
+	// would publish and then never match anything — a silent blackhole on
+	// the single most common idiom pasted from Traefik configs.
+	if strings.ContainsRune(val, '`') {
+		return "", fmt.Errorf("backticks are not valid around matcher values (got %s at position %d): remove the Traefik-style backticks and use a bare value, e.g. Host(app.example.com), or double quotes", val, start)
+	}
 	return val, nil
 }
 

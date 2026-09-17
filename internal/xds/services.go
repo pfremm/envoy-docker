@@ -116,14 +116,13 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 	// HTTP/HTTPS pair) always exists and carries every router that sets no
 	// .entrypoints label (or the configured default); each configured extra
 	// entrypoint carries only the routers that explicitly select it. A router
-	// selecting an entrypoint the daemon did not configure is rejected:
-	// entrypoint addresses/ports are operator configuration, so a label can
-	// only SELECT among them, never conjure a new bound socket.
-	byEntrypoint, entrypointNames, err := groupRoutesByEntrypoint(httpCfg.Routes, cfg)
-	if err != nil {
-		return nil, err
-	}
-
+	// selecting an entrypoint the daemon did not configure is skipped on
+	// that entrypoint with a warning: entrypoint addresses/ports are
+	// operator configuration, so a label can only SELECT among them, never
+	// conjure a new bound socket — and an invalid selection must not wedge
+	// the whole snapshot.
+	httpCfg.Routes = dedupeRouteNames(httpCfg.Routes, cfg.Logger)
+	byEntrypoint, entrypointNames := groupRoutesByEntrypoint(httpCfg.Routes, cfg, cfg.Logger)
 	// One RDS route configuration per entrypoint. The default entrypoint keeps
 	// the legacy resource name (https_routes); extra entrypoints get a
 	// namespaced name (https_routes__<entrypoint>).
@@ -304,7 +303,7 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 	}
 	applySecurityDefaultsToAll(routeConfigs, plan)
 
-	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg)
+	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg, cfg.Logger)
 	if err != nil {
 		return nil, fmt.Errorf("building tcp resources: %w", err)
 	}
