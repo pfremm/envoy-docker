@@ -180,19 +180,56 @@ standard middleware stack. Unsupported orderings reject only that router.
 | `errors` | `status` (required list of codes/ranges like `404,500-599`), `service` (required), `query` (path, optional) |
 | `grpcweb` | `enabled` (must be `true`; omit the middleware if you don't want gRPC-Web) |
 
-#### Resilience and protocol middleware limitations
+#### Resilience and protocol middleware
 
-**Compression and gRPC-Web** are listener-level filters in Envoy v1.37 and
-currently parse but do not yet emit xDS configuration. A future build will
-add listener-level installation when at least one route references them.
+**Compression** installs Envoy's native compressor filter listener-wide when
+at least one route references a `compress` middleware: gzip is always
+installed, and brotli is installed alongside it when
+`COMPRESSION_BROTLI_ENABLED` is not explicitly set to false (default true;
+the go-control-plane API this control plane is built against always carries
+the brotli compressor proto, but the actual deployed Envoy binary must also
+have been built with the brotli extension — the standard `envoyproxy/envoy`
+image does, minimal/alpine variants may not, hence the override). Because
+Envoy's compressor filter is listener-scoped, every route referencing
+`compress` must configure identical settings; conflicting definitions are
+rejected rather than one silently winning. `minresponsebytes`,
+`contenttypes`, and `disableonetagheader` are wired to the filter's
+response-direction config. `excludedcontenttypes` has no Envoy equivalent
+(the compressor filter only exposes an allow-list) and is rejected at model
+validation.
 
-**Circuit breakers** are cluster-scoped in Envoy. The xDS layer will derive
-deterministic cluster variants when policies differ across routes and
-deduplicate identical policies. This is not yet implemented; the middleware
-is accepted but circuit-breaking logic is pending.
+**gRPC-Web** installs Envoy's native `grpc_web` filter listener-wide when at
+least one route references a `grpcweb` middleware, positioned before CORS in
+the filter chain (gRPC-Web must translate the browser request before CORS
+preflight logic runs). A route with `grpcweb` must select a named HTTP
+service configured with `loadbalancer.protocol=grpc` or `http2`; a legacy
+port-only route or an http1/https-protocol service is rejected, since the
+grpc_web filter's framing translation only round-trips over an HTTP/2
+upstream.
 
-**Error pages** require internal redirect to a named error service. The
-middleware is accepted and validated, but redirect installation is pending.
+**Circuit breakers** are cluster-scoped in Envoy but this middleware is
+per-route, so the xDS layer derives deterministic cluster variants when
+routes sharing one base cluster (a legacy route's own cluster, or a single
+non-weighted named service) request different policies, and deduplicates
+identical policies onto one shared variant. When every route sharing a base
+cluster requests the identical policy, it is applied directly to the base
+cluster with no variant. Variant cluster names are a deterministic
+`<base>~cb-c<maxconnections>-p<maxpending>-r<maxrequests>-t<maxretries>`
+suffix, so identical policies always produce identical cluster names.
+`circuitbreaker` middleware cannot be combined with a route selecting a
+weighted service, since a weighted service has no single base cluster to
+vary; this is rejected at snapshot build time.
+
+**Error pages** install Envoy's native `custom_response` filter
+listener-wide when at least one route references an `errors` middleware,
+with the actual matching/redirect behavior entirely in a per-route override:
+a matcher over the configured status codes/ranges (using Envoy's status
+class matcher for a `NxxN` pattern spanning a full class, exact-code
+matchers otherwise) redirects internally (via `redirect_policy`) to a
+synthetic virtual host for the named `errors.service`. `errors.service` must
+resolve to a named HTTP service (`envoy.http.services.<name>.*`); a service
+that is itself served by a route carrying its own `errors` middleware is
+rejected outright (no recursive error handling).
 
 **Retry** policies are per-route and fully implemented via
 `RouteAction.RetryPolicy`. Middleware retry overrides router-level retry

@@ -75,10 +75,10 @@ func TestApplyRouteMiddlewares_Retry(t *testing.T) {
 
 func TestApplyRouteMiddlewares_Buffering(t *testing.T) {
 	tests := []struct {
-		name                  string
-		mw                    []model.Middleware
-		wantBufferPerRoute    bool
-		wantMaxRequestBytes   uint32
+		name                string
+		mw                  []model.Middleware
+		wantBufferPerRoute  bool
+		wantMaxRequestBytes uint32
 	}{
 		{
 			name: "buffering middleware sets buffer config",
