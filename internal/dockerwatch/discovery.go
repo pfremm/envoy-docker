@@ -378,6 +378,15 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 	}
 	// Validate references and cycles after every container has been parsed.
 	cfg := model.HTTPConfiguration{Routes: map[string]model.Route{}, Services: services, Middlewares: middlewares}
+	// routerSubdomain records which subdomain first claimed each router
+	// name. Router names become global xDS route resource names
+	// (routeResourceName), so the same name on two DIFFERENT subdomains
+	// would collide at the build layer and reject the whole snapshot; skip
+	// the later router (containers are ID-sorted, so this is
+	// deterministic) with a warning instead, mirroring the TCP guard.
+	// The same name on the SAME subdomain is the replica/conflict path
+	// handled below via routesCompatible/precedence.
+	routerSubdomain := map[string]string{}
 	for sn, s := range services {
 		if err := s.Validate(); err != nil {
 			invalidServices[sn] = err
@@ -452,6 +461,11 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 				route.Endpoints = []model.Endpoint{{Address: addr, Port: r.port}}
 			}
 			old, exists := cfg.Routes[r.subdomain]
+			if claimed, dup := routerSubdomain[rn]; dup && claimed != r.subdomain {
+				logger.Warn("skipping router: duplicate router name across containers",
+					"container", name, "router", rn, "subdomain", r.subdomain, "claimed_by_subdomain", claimed)
+				continue
+			}
 			if exists {
 				if !routesCompatible(old, route) {
 					// A subdomain can only be represented by one route in the
@@ -459,6 +473,10 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 					// deterministic precedence as xDS; a loser is non-fatal.
 					if model.Precedence(route, old) {
 						logger.Warn("replacing lower-precedence router conflict", "subdomain", r.subdomain, "kept", route.Origin, "skipped", old.Origin)
+						if old.RouterName != rn {
+							delete(routerSubdomain, old.RouterName)
+						}
+						routerSubdomain[rn] = r.subdomain
 						cfg.Routes[r.subdomain] = route
 					} else {
 						logger.Warn("skipping lower-precedence router conflict", "subdomain", r.subdomain, "kept", old.Origin, "skipped", route.Origin)
@@ -469,6 +487,7 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 				old.Origin += "," + route.Origin
 				cfg.Routes[r.subdomain] = old
 			} else {
+				routerSubdomain[rn] = r.subdomain
 				cfg.Routes[r.subdomain] = route
 			}
 		}

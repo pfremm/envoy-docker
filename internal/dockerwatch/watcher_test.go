@@ -375,8 +375,36 @@ func TestDiscoverConflictingRoutersUsesPriority(t *testing.T) {
 			"envoy.http.routers.web.priority": priority,
 		}, NetworkSettings: &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{"proxy": {IPAddress: ip}}}}
 	}
-	cfg := discover([]container.Summary{mk("low", "Host(app.example.com)", "1", "10.0.0.1"), mk("high", "Host(app.example.com) && PathPrefix(`/admin`)", "10", "10.0.0.2")}, "proxy", nil)
+	cfg := discover([]container.Summary{mk("low", "Host(app.example.com)", "1", "10.0.0.1"), mk("high", "Host(app.example.com) && PathPrefix(/admin)", "10", "10.0.0.2")}, "proxy", nil)
 	if got := cfg.Routes["app"].Origin; !strings.HasPrefix(got, "high/") {
 		t.Fatalf("winner=%q", got)
+	}
+}
+
+func TestDiscoverDuplicateRouterNamesAcrossContainers(t *testing.T) {
+	// Two unrelated containers both name their router "web" on DIFFERENT
+	// subdomains. Router names become global xDS route resource names, so
+	// without a discovery-level guard the duplicate would reject the whole
+	// snapshot at build time (wedging every future update). The guard keeps
+	// the first (container-ID-sorted) claim and skips the later router with
+	// a warning, mirroring the TCP duplicate-name guard.
+	mk := func(id, subdomain, ip string) container.Summary {
+		return container.Summary{ID: id, Names: []string{"/" + id}, Labels: map[string]string{
+			"envoy.enable": "true", "envoy.http.routers.web.subdomain": subdomain,
+			"envoy.http.routers.web.port": "8080",
+		}, NetworkSettings: &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{"proxy": {IPAddress: ip}}}}
+	}
+	cfg := discover([]container.Summary{mk("c1", "app1", "10.0.0.1"), mk("c2", "app2", "10.0.0.2")}, "proxy", nil)
+	if _, ok := cfg.Routes["app1"]; !ok {
+		t.Fatalf("first claimant app1 should keep router name web, got %+v", cfg.Routes)
+	}
+	if _, ok := cfg.Routes["app2"]; ok {
+		t.Fatalf("later duplicate router name must be skipped, got %+v", cfg.Routes)
+	}
+	// Replicas of the SAME subdomain still merge (not treated as duplicates).
+	cfg2 := discover([]container.Summary{mk("c1", "app1", "10.0.0.1"), mk("c2", "app1", "10.0.0.2")}, "proxy", nil)
+	r, ok := cfg2.Routes["app1"]
+	if !ok || len(r.Endpoints) != 2 {
+		t.Fatalf("same-subdomain replicas should merge endpoints, got %+v", cfg2.Routes)
 	}
 }

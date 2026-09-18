@@ -176,3 +176,50 @@ func TestBuildSnapshotForConfigRejectsUnknownAndCycle(t *testing.T) {
 		t.Fatal("expected cycle error")
 	}
 }
+
+// The config-path builder (the one main.go actually uses) must also always
+// emit the default https_routes RDS resource, including on the initial
+// publish with zero routes.
+func TestBuildSnapshotForConfigEmptyStillPublishesDefaultRouteConfig(t *testing.T) {
+	cfg := Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443, CertSecretName: "c", ACMESDSClusterName: "a"}
+	snap, err := BuildSnapshotForConfig("1", model.HTTPConfiguration{}, cfg)
+	if err != nil {
+		t.Fatalf("BuildSnapshotForConfig() unexpected error: %v", err)
+	}
+	rcs := snap.GetResources(resourcev3.RouteType)
+	if _, ok := rcs[httpsRouteConfigName]; !ok {
+		t.Fatalf("default route config %q must exist with zero routes, got %v", httpsRouteConfigName, rcs)
+	}
+}
+
+// Two containers reusing the same router name on DIFFERENT subdomains must
+// not reject the whole snapshot: the build-layer dedupe keeps the first
+// claimant (sorted-subdomain order, deterministic) and skips the later one
+// with a warning, mirroring the discovery-layer guard (which also covers
+// docker paths; this one additionally covers static config).
+func TestBuildSnapshotForConfigDuplicateRouterNamesDeduped(t *testing.T) {
+	cfg := Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443, CertSecretName: "c", ACMESDSClusterName: "a"}
+	httpCfg := model.HTTPConfiguration{
+		Routes: map[string]model.Route{
+			"app1": {Subdomain: "app1", RouterName: "web", Origin: "c1/web", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 80}}},
+			"app2": {Subdomain: "app2", RouterName: "web", Origin: "c2/web", Endpoints: []model.Endpoint{{Address: "10.0.0.2", Port: 80}}},
+		},
+	}
+	snap, err := BuildSnapshotForConfig("1", httpCfg, cfg)
+	if err != nil {
+		t.Fatalf("duplicate router names must not reject the snapshot: %v", err)
+	}
+	rc := snap.GetResources(resourcev3.RouteType)[httpsRouteConfigName].(*routev3.RouteConfiguration)
+	domains := map[string]bool{}
+	for _, vh := range rc.VirtualHosts {
+		for _, d := range vh.Domains {
+			domains[d] = true
+		}
+	}
+	if !domains["app1.example.com"] {
+		t.Errorf("first claimant app1 should publish, got %v", domains)
+	}
+	if domains["app2.example.com"] {
+		t.Errorf("later duplicate app2 must be skipped, got %v", domains)
+	}
+}

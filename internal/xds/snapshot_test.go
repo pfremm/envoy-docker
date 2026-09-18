@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"io"
 	"log/slog"
-	"strings"
 	"testing"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -264,8 +263,10 @@ func TestBuildRouteConfig_SameHostPrecedence(t *testing.T) {
 }
 
 func TestBuildRouteConfig_LegacyMovesToCatchAll(t *testing.T) {
-	// With a rule-based route present, a legacy subdomain route must move
-	// into the catch-all "*" virtual host.
+	// With a rule-based route present, a legacy subdomain route keeps its
+	// own exact-domain virtual host (host isolation) AND is additionally
+	// carried in the catch-all "*" virtual host (documented additive
+	// fallback for hosts nothing else claims).
 	r, err := rule.Parse(`Host(app.example.com) && PathPrefix(/api)`)
 	if err != nil {
 		t.Fatal(err)
@@ -294,6 +295,15 @@ func TestBuildRouteConfig_LegacyMovesToCatchAll(t *testing.T) {
 	if _, ok := byDomain["app.example.com"]; !ok {
 		t.Errorf("expected virtual host app.example.com, got %v", byDomain)
 	}
+	// Host isolation: the legacy route keeps its own exact-domain virtual
+	// host even though a rule-based route exists.
+	legacyVH, ok := byDomain["legacy.example.com"]
+	if !ok {
+		t.Fatalf("expected exact-domain virtual host legacy.example.com, got %v", byDomain)
+	}
+	if len(legacyVH.Routes) != 1 || legacyVH.Routes[0].GetRoute().GetCluster() != "legacy" {
+		t.Errorf("legacy.example.com should carry the legacy route, got %+v", legacyVH.Routes)
+	}
 	catchAll, ok := byDomain["*"]
 	if !ok {
 		t.Fatalf("expected catch-all virtual host, got %v", byDomain)
@@ -303,6 +313,92 @@ func TestBuildRouteConfig_LegacyMovesToCatchAll(t *testing.T) {
 	}
 	if catchAll.Routes[0].GetMatch().GetPrefix() != "/" {
 		t.Errorf("legacy catch-all route prefix = %q, want /", catchAll.Routes[0].GetMatch().GetPrefix())
+	}
+}
+
+func TestBuildRouteConfig_LegacyHostIsolationWithRuleRoutes(t *testing.T) {
+	// Regression: with a rule-based route present and TWO legacy routes,
+	// each legacy subdomain must keep its own virtual host. When both were
+	// emitted only into the catch-all as unconstrained prefix-/ routes,
+	// the first captured every unmatched host: requests for
+	// b.example.com were routed to a's backend (cross-host traffic bleed)
+	// and b was unreachable.
+	r, err := rule.Parse(`Host(app.example.com)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := map[string]model.Route{
+		"a": {
+			Subdomain: "a", RouterName: "a", Source: model.SourceDocker, Origin: "c/a",
+			Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8081}},
+		},
+		"b": {
+			Subdomain: "b", RouterName: "b", Source: model.SourceDocker, Origin: "c/b",
+			Endpoints: []model.Endpoint{{Address: "10.0.0.2", Port: 8082}},
+		},
+		"rule": {
+			Subdomain: "rule", RouterName: "rule", Source: model.SourceDocker, Origin: "c/rule",
+			Rule: r, RuleExpr: `Host(app.example.com)`,
+			Endpoints: []model.Endpoint{{Address: "10.0.0.3", Port: 8083}},
+		},
+	}
+	rc := buildHTTPSRouteConfiguration(routes, sortedSubdomains(routes), "example.com", testLogger())
+	byDomain := vhByDomain(t, rc)
+
+	for sub, cluster := range map[string]string{"a": "a", "b": "b"} {
+		domain := sub + ".example.com"
+		vh, ok := byDomain[domain]
+		if !ok {
+			t.Fatalf("expected exact-domain virtual host %s (host isolation), got %v", domain, byDomain)
+		}
+		if len(vh.Routes) != 1 || vh.Routes[0].GetRoute().GetCluster() != cluster {
+			t.Errorf("%s should route to its own cluster %q, got %+v", domain, cluster, vh.Routes)
+		}
+	}
+	// The catch-all still exists for truly unmatched hosts.
+	if _, ok := byDomain["*"]; !ok {
+		t.Errorf("expected catch-all virtual host, got %v", byDomain)
+	}
+}
+
+func TestBuildRouteConfig_LegacySharesHostWithRuleRoute(t *testing.T) {
+	// A legacy route whose <subdomain>.<baseDomain> host is also claimed
+	// by a rule-based route must join that virtual host (no duplicate
+	// domains, which Envoy rejects) with precedence arbitration.
+	r, err := rule.Parse(`Host(shared.example.com) && PathPrefix(/api)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := map[string]model.Route{
+		"api": {
+			Subdomain: "api", RouterName: "api", Source: model.SourceDocker, Origin: "c/api",
+			Rule: r, RuleExpr: `Host(shared.example.com) && PathPrefix(/api)`,
+			Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8081}},
+		},
+		"shared": {
+			Subdomain: "shared", RouterName: "shared", Source: model.SourceDocker, Origin: "c/shared",
+			Endpoints: []model.Endpoint{{Address: "10.0.0.2", Port: 8082}},
+		},
+	}
+	rc := buildHTTPSRouteConfiguration(routes, sortedSubdomains(routes), "example.com", testLogger())
+	seen := map[string]int{}
+	for _, vh := range rc.VirtualHosts {
+		for _, d := range vh.Domains {
+			seen[d]++
+		}
+	}
+	if seen["shared.example.com"] != 1 {
+		t.Fatalf("domain shared.example.com must appear exactly once, got %d (vhosts: %+v)", seen["shared.example.com"], rc.VirtualHosts)
+	}
+	vh := vhByDomain(t, rc)["shared.example.com"]
+	if len(vh.Routes) != 2 {
+		t.Fatalf("shared virtual host should carry both routes, got %+v", vh.Routes)
+	}
+	// The more specific rule route must be evaluated before the legacy
+	// catch-all prefix route.
+	if vh.Routes[0].GetRoute().GetCluster() != "api" || vh.Routes[1].GetRoute().GetCluster() != "shared" {
+		t.Errorf("expected [api, shared] precedence order, got [%s, %s]",
+			vh.Routes[0].GetRoute().GetCluster(), vh.Routes[1].GetRoute().GetCluster())
 	}
 }
 
@@ -434,10 +530,7 @@ func TestGroupRoutesByEntrypoint_DefaultAndExplicit(t *testing.T) {
 		// Served on both the default and admin entrypoints.
 		"both": {Subdomain: "both", Endpoints: []model.Endpoint{{Address: "10.0.0.3", Port: 8080}}, Entrypoints: []string{"default", "admin"}},
 	}
-	byEp, names, err := groupRoutesByEntrypoint(routes, cfg)
-	if err != nil {
-		t.Fatalf("groupRoutesByEntrypoint() unexpected error: %v", err)
-	}
+	byEp, names := groupRoutesByEntrypoint(routes, cfg, testLogger())
 	wantNames := []string{"admin", "default"}
 	if len(names) != 2 || names[0] != wantNames[0] || names[1] != wantNames[1] {
 		t.Fatalf("entrypointNames = %v, want %v (sorted, always includes default)", names, wantNames)
@@ -458,17 +551,62 @@ func TestGroupRoutesByEntrypoint_DefaultAndExplicit(t *testing.T) {
 	}
 }
 
-func TestGroupRoutesByEntrypoint_UnknownEntryptRejected(t *testing.T) {
+func TestGroupRoutesByEntrypoint_UnknownEntrypointSkipsRouterOnly(t *testing.T) {
 	cfg := Config{HTTPEntrypoints: map[string]uint32{"admin": 8443}}
 	routes := map[string]model.Route{
-		"bad": {Subdomain: "bad", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}, Entrypoints: []string{"ghost"}},
+		"bad":  {Subdomain: "bad", RouterName: "bad", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}, Entrypoints: []string{"ghost"}},
+		"good": {Subdomain: "good", RouterName: "good", Endpoints: []model.Endpoint{{Address: "10.0.0.2", Port: 8080}}},
 	}
-	_, _, err := groupRoutesByEntrypoint(routes, cfg)
-	if err == nil {
-		t.Fatal("groupRoutesByEntrypoint() expected an error for an unknown entrypoint, got nil")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	byEp, names := groupRoutesByEntrypoint(routes, cfg, logger)
+	// The bad router is skipped (not served anywhere), the good router is
+	// unaffected, and no error wedges the snapshot.
+	wantNames := []string{"default"}
+	if len(names) != 1 || names[0] != wantNames[0] {
+		t.Fatalf("entrypointNames = %v, want %v", names, wantNames)
 	}
-	if !strings.Contains(err.Error(), "ghost") {
-		t.Errorf("error = %q, want it to name the unknown entrypoint %q", err.Error(), "ghost")
+	if _, ok := byEp["default"]["good"]; !ok {
+		t.Errorf("good route should be served on the default entrypoint, got %+v", byEp)
+	}
+	if _, ok := byEp["default"]["bad"]; ok {
+		t.Errorf("bad route must not fall back to the default entrypoint, got %+v", byEp)
+	}
+	if !bytes.Contains(logs.Bytes(), []byte("ghost")) {
+		t.Errorf("expected a warning naming the unknown entrypoint %q, got: %s", "ghost", logs.String())
+	}
+}
+
+// One bad label must never wedge the whole snapshot: a router referencing an
+// unknown entrypoint is skipped, every other route still publishes, and the
+// snapshot version advances (regression test for the control-plane-wide
+// config-update denial defect).
+func TestBuildSnapshot_UnknownEntrypointDoesNotWedgeSnapshot(t *testing.T) {
+	cfg := Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443, CertSecretName: "c", ACMESDSClusterName: "a",
+		HTTPEntrypoints: map[string]uint32{"admin": 8443}}
+	routes := map[string]model.Route{
+		"bad":  {Subdomain: "bad", RouterName: "bad", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}, Entrypoints: []string{"ghost"}},
+		"good": {Subdomain: "good", RouterName: "good", Endpoints: []model.Endpoint{{Address: "10.0.0.2", Port: 8080}}},
+	}
+	snap, err := BuildSnapshotWithLogger("1", routes, cfg, testLogger())
+	if err != nil {
+		t.Fatalf("BuildSnapshotWithLogger() must not fail on a label-derived problem: %v", err)
+	}
+	rc := snap.GetResources(resourcev3.RouteType)[httpsRouteConfigName].(*routev3.RouteConfiguration)
+	domains := map[string]bool{}
+	for _, vh := range rc.VirtualHosts {
+		for _, d := range vh.Domains {
+			domains[d] = true
+		}
+	}
+	if !domains["good.example.com"] {
+		t.Errorf("good route should still publish, got domains %v", domains)
+	}
+	if domains["bad.example.com"] {
+		t.Errorf("bad route must not publish, got domains %v", domains)
+	}
+	if _, ok := snap.GetResources(resourcev3.ClusterType)["bad"]; ok {
+		t.Error("bad route must not get a cluster")
 	}
 }
 
@@ -482,12 +620,12 @@ func TestGroupRoutesByEntrypoint_ConfiguredDefault(t *testing.T) {
 	routes := map[string]model.Route{
 		"legacy": {Subdomain: "legacy", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}},
 	}
-	byEp, names, err := groupRoutesByEntrypoint(routes, cfg)
-	if err != nil {
-		t.Fatalf("groupRoutesByEntrypoint() unexpected error: %v", err)
-	}
-	if len(names) != 1 || names[0] != "admin" {
-		t.Fatalf("entrypointNames = %v, want [admin] (configured default)", names)
+	byEp, names := groupRoutesByEntrypoint(routes, cfg, testLogger())
+	// The default entrypoint is always emitted (its listener is
+	// unconditional, so its RDS resource must exist even when empty)
+	// alongside the configured default that carries the route.
+	if len(names) != 2 || names[0] != "admin" || names[1] != "default" {
+		t.Fatalf("entrypointNames = %v, want [admin default]", names)
 	}
 	if _, ok := byEp["admin"]["legacy"]; !ok {
 		t.Errorf("legacy route should be on the configured default entrypoint, got %+v", byEp)
@@ -663,5 +801,45 @@ func TestBuildSnapshot_ObservabilityOnEmittedRoutes(t *testing.T) {
 	}
 	if er.Metadata == nil || er.Metadata.FilterMetadata[observabilityMetadataNamespace] == nil {
 		t.Errorf("emitted route should carry observability metadata, got %+v", er.Metadata)
+	}
+}
+
+// The default https_listener is always published and references the
+// "https_routes" RDS resource by name, so that resource must exist in EVERY
+// snapshot — otherwise the listener warms forever on the initial (empty)
+// publish, permanently when all routes select named entrypoints, and SOTW
+// RDS never withdraws a stale route config on scale-to-zero.
+func TestBuildSnapshot_EmptyRoutesStillPublishDefaultRouteConfig(t *testing.T) {
+	cfg := Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443, CertSecretName: "c", ACMESDSClusterName: "a"}
+	snap, err := BuildSnapshot("1", map[string]model.Route{}, cfg)
+	if err != nil {
+		t.Fatalf("BuildSnapshot() unexpected error: %v", err)
+	}
+	rcs := snap.GetResources(resourcev3.RouteType)
+	rc, ok := rcs[httpsRouteConfigName]
+	if !ok {
+		t.Fatalf("default route config %q must exist with zero routes, got %v", httpsRouteConfigName, rcs)
+	}
+	if vhs := rc.(*routev3.RouteConfiguration).VirtualHosts; len(vhs) != 0 {
+		t.Errorf("empty snapshot's default route config should have no virtual hosts, got %+v", vhs)
+	}
+}
+
+func TestBuildSnapshot_AllRoutesOnNamedEntrypointStillPublishDefaultRouteConfig(t *testing.T) {
+	cfg := Config{BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443, CertSecretName: "c", ACMESDSClusterName: "a",
+		HTTPEntrypoints: map[string]uint32{"admin": 8443}}
+	routes := map[string]model.Route{
+		"app": {Subdomain: "app", RouterName: "app", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 80}}, Entrypoints: []string{"admin"}},
+	}
+	snap, err := BuildSnapshot("1", routes, cfg)
+	if err != nil {
+		t.Fatalf("BuildSnapshot() unexpected error: %v", err)
+	}
+	rcs := snap.GetResources(resourcev3.RouteType)
+	if _, ok := rcs[httpsRouteConfigName]; !ok {
+		t.Fatalf("default route config %q must exist when every route selects a named entrypoint, got %v", httpsRouteConfigName, rcs)
+	}
+	if _, ok := rcs[httpsRouteConfigName+"__admin"]; !ok {
+		t.Fatalf("expected route config %q, got %v", httpsRouteConfigName+"__admin", rcs)
 	}
 }

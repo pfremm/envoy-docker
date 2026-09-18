@@ -205,13 +205,28 @@ func TestDetectTCPConflicts_OverlappingConcreteSNIRejected(t *testing.T) {
 	}
 }
 
-func TestDetectTCPConflicts_DistinctPrioritiesAllowed(t *testing.T) {
+func TestDetectTCPConflicts_DistinctPrioritiesStillConflict(t *testing.T) {
+	// Envoy filter-chain matching is structural: identical SNI matches are
+	// duplicate FilterChainMatch entries that Envoy NACKs regardless of
+	// chain order, so explicit priorities cannot disambiguate them.
 	routers := []TCPRouter{
 		{Name: "r1", Rule: hostSNI("a.com"), TLSPassthrough: true, Priority: 10, PrioritySet: true},
 		{Name: "r2", Rule: hostSNI("a.com"), TLSPassthrough: true, Priority: 5, PrioritySet: true},
 	}
-	if err := DetectTCPConflicts(routers, "web"); err != nil {
-		t.Fatalf("distinct explicit priorities should not conflict: %v", err)
+	if err := DetectTCPConflicts(routers, "web"); err == nil {
+		t.Fatal("identical SNI with distinct priorities must still conflict (duplicate Envoy filter-chain match)")
+	}
+}
+
+func TestTCPFilterChainOverlap(t *testing.T) {
+	a := TCPRouter{Name: "a", Rule: hostSNI("x.com"), TLSPassthrough: true, Priority: 10, PrioritySet: true}
+	b := TCPRouter{Name: "b", Rule: hostSNI("x.com"), TLSPassthrough: true, Priority: 5, PrioritySet: true}
+	if !TCPFilterChainOverlap(a, b) {
+		t.Fatal("identical SNI sets must overlap regardless of priority")
+	}
+	c := TCPRouter{Name: "c", Rule: hostSNI("y.com"), TLSPassthrough: true}
+	if TCPFilterChainOverlap(a, c) {
+		t.Fatal("disjoint SNI sets must not overlap")
 	}
 }
 

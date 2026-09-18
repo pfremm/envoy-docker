@@ -1,6 +1,7 @@
 package rule
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
@@ -320,5 +321,28 @@ func TestParse_WhitespaceTolerance(t *testing.T) {
 	want := "(Host(a.com) && PathPrefix(/api))"
 	if r.String() != want {
 		t.Errorf("got %q, want %q", r.String(), want)
+	}
+}
+
+func TestParse_BacktickedValuesRejected(t *testing.T) {
+	// Traefik configs quote matcher values with backticks. Accepting them
+	// silently would embed the backticks in the value and blackhole the
+	// router (a vhost domain "`app.example.com`" never matches a real
+	// :authority), so they must be rejected with an actionable error.
+	for _, expr := range []string{
+		"Host(`app.example.com`)",
+		"Host(app.example.com) && PathPrefix(`/api`)",
+		"Headers(`X-Debug`, `1`)",
+	} {
+		if _, err := Parse(expr); err == nil {
+			t.Errorf("Parse(%q) expected a backtick rejection error, got nil", expr)
+		} else if !strings.Contains(err.Error(), "backtick") {
+			t.Errorf("Parse(%q) error = %q, want it to mention backticks", expr, err)
+		}
+	}
+	// Backticks inside double-quoted strings remain allowed (quoted args
+	// are explicitly arbitrary content).
+	if _, err := Parse("Headers(\"X-Tick\", \"a`b\")"); err != nil {
+		t.Errorf("backtick inside a double-quoted value should parse, got %v", err)
 	}
 }
