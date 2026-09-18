@@ -411,6 +411,30 @@ match wins. The control plane orders routes with a deterministic precedence
    `PathPrefix(/)`.
 3. **Router name** — a stable alphabetical tie-breaker.
 
+### Several routers on one subdomain
+
+Distinct routers (different router label names) may share one subdomain.
+Every one of them is preserved through discovery and reaches the precedence
+evaluation above — the control plane never discards a router before its rule
+has been considered. They are emitted into a **single** virtual host for that
+host (one domain must be claimed by exactly one virtual host; Envoy rejects a
+route configuration with duplicate domains), ordered by the precedence rules,
+so a narrow `PathPrefix(/admin)` router is evaluated before a broad
+`Host(...)` router on the same subdomain and neither shadows the other.
+
+Each such router gets its own Envoy cluster and endpoint assignment, so it
+keeps its own backend: the subdomain's highest-precedence router keeps the
+legacy cluster name (the subdomain itself) and every other router sharing
+that subdomain gets `<subdomain>#<router>`. Single-router subdomains — the
+common case — are completely unchanged.
+
+Two containers advertising the **same router name** on the same subdomain are
+still replicas of one router and merge into a multi-endpoint route (round
+robin), matching Traefik's behavior for a scaled compose service. Only a
+genuinely incompatible redefinition of that one router (same name, different
+rule/service/policy) resolves by precedence, since there is no second router
+to preserve.
+
 A rule-based route is served by the virtual host of its rule's first
 `Host(...)` atom. A legacy (no-rule) route keeps its own
 `<subdomain>.<baseDomain>` virtual host **in every configuration**, so legacy

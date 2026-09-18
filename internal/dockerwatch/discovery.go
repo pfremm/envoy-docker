@@ -387,6 +387,16 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 	// The same name on the SAME subdomain is the replica/conflict path
 	// handled below via routesCompatible/precedence.
 	routerSubdomain := map[string]string{}
+	// bySubdomain accumulates every router accepted for a subdomain.
+	// DISTINCT routers (different router names) sharing one subdomain are
+	// ALL preserved rather than resolved here: discovery must not decide
+	// which router wins, because that decision belongs to the xDS
+	// precedence/fallback evaluation, which sees the rules. The routes are
+	// materialised into cfg.Routes after every container is parsed (the
+	// subdomain's highest-precedence router keeps the bare subdomain key
+	// and legacy cluster name; the others get a derived key and their own
+	// ClusterKey).
+	bySubdomain := map[string][]model.Route{}
 	for sn, s := range services {
 		if err := s.Validate(); err != nil {
 			invalidServices[sn] = err
@@ -460,36 +470,73 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 				}
 				route.Endpoints = []model.Endpoint{{Address: addr, Port: r.port}}
 			}
-			old, exists := cfg.Routes[r.subdomain]
 			if claimed, dup := routerSubdomain[rn]; dup && claimed != r.subdomain {
 				logger.Warn("skipping router: duplicate router name across containers",
 					"container", name, "router", rn, "subdomain", r.subdomain, "claimed_by_subdomain", claimed)
 				continue
 			}
-			if exists {
+			// Find an existing route for the SAME router name on this
+			// subdomain: that is the replica path (a scaled compose
+			// service), which merges endpoints. A router with a
+			// DIFFERENT name is a distinct router and is preserved
+			// alongside, so xDS can order both by precedence.
+			existing := bySubdomain[r.subdomain]
+			replica := -1
+			for i, old := range existing {
+				if old.RouterName == rn {
+					replica = i
+					break
+				}
+			}
+			if replica >= 0 {
+				old := existing[replica]
 				if !routesCompatible(old, route) {
-					// A subdomain can only be represented by one route in the
-					// current model. Resolve competing routers using the same
-					// deterministic precedence as xDS; a loser is non-fatal.
+					// Same router name, same subdomain, incompatible
+					// definition: the two containers disagree about what
+					// this one router is. There is no second router to
+					// preserve here, so keep the deterministic
+					// higher-precedence definition.
 					if model.Precedence(route, old) {
-						logger.Warn("replacing lower-precedence router conflict", "subdomain", r.subdomain, "kept", route.Origin, "skipped", old.Origin)
-						if old.RouterName != rn {
-							delete(routerSubdomain, old.RouterName)
-						}
-						routerSubdomain[rn] = r.subdomain
-						cfg.Routes[r.subdomain] = route
+						logger.Warn("replacing lower-precedence router conflict", "subdomain", r.subdomain, "router", rn, "kept", route.Origin, "skipped", old.Origin)
+						existing[replica] = route
 					} else {
-						logger.Warn("skipping lower-precedence router conflict", "subdomain", r.subdomain, "kept", old.Origin, "skipped", route.Origin)
+						logger.Warn("skipping lower-precedence router conflict", "subdomain", r.subdomain, "router", rn, "kept", old.Origin, "skipped", route.Origin)
 					}
 					continue
 				}
 				old.Endpoints = append(old.Endpoints, route.Endpoints...)
 				old.Origin += "," + route.Origin
-				cfg.Routes[r.subdomain] = old
-			} else {
-				routerSubdomain[rn] = r.subdomain
-				cfg.Routes[r.subdomain] = route
+				existing[replica] = old
+				continue
 			}
+			routerSubdomain[rn] = r.subdomain
+			bySubdomain[r.subdomain] = append(existing, route)
+		}
+	}
+	// Materialise the accepted routers into cfg.Routes. Every distinct
+	// router survives discovery: the subdomain's highest-precedence router
+	// keeps the bare subdomain key and the legacy subdomain-named cluster
+	// (so single-router subdomains, the overwhelmingly common case, are
+	// byte-identical to before), and each remaining router is stored under
+	// "<subdomain>#<router>" with its own ClusterKey so it reaches xDS with
+	// distinct cluster/endpoint resources.
+	for subdomain, routes := range bySubdomain {
+		ordered := model.SortByPrecedence(routes)
+		for i, route := range ordered {
+			if i == 0 {
+				cfg.Routes[subdomain] = route
+				continue
+			}
+			route.ClusterKey = derivedClusterName(subdomain, route.RouterName)
+			cfg.Routes[derivedRouteKey(subdomain, route.RouterName)] = route
+		}
+		if len(ordered) > 1 {
+			names := make([]string, 0, len(ordered))
+			for _, route := range ordered {
+				names = append(names, route.RouterName)
+			}
+			logger.Info("subdomain served by several routers; all preserved for precedence evaluation",
+				"subdomain", subdomain, "routers", strings.Join(names, ","))
 		}
 	}
 	for sn, s := range cfg.Services {
@@ -502,6 +549,21 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 		cfg.Services[sn] = s
 	}
 	return cfg
+}
+
+// derivedRouteKey is the HTTPConfiguration.Routes map key for a router that
+// shares its subdomain with a higher-precedence router. The "#" separator
+// cannot appear in a subdomain or a router label name, so a derived key can
+// never collide with a bare subdomain key.
+func derivedRouteKey(subdomain, routerName string) string {
+	return subdomain + "#" + routerName
+}
+
+// derivedClusterName is the Envoy cluster/endpoint name for such a router.
+// It must be distinct from the subdomain-named cluster the subdomain's
+// highest-precedence router keeps, and stable across rebuilds.
+func derivedClusterName(subdomain, routerName string) string {
+	return subdomain + "#" + routerName
 }
 
 func routesCompatible(a, b model.Route) bool {

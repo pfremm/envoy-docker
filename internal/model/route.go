@@ -83,6 +83,14 @@ type Route struct {
 	// declarative carrier of intent, not a per-route log toggle (see LABELS.md
 	// limitations).
 	AccessLog *bool
+
+	// ClusterKey, when non-empty, overrides the derived Envoy cluster and
+	// endpoint (CLA) name for this route (see ClusterName). Discovery sets
+	// it when several DISTINCT routers share one subdomain: every router is
+	// preserved through to xDS precedence evaluation, so each needs its own
+	// cluster instead of colliding on the shared subdomain name. Empty means
+	// the legacy behavior (cluster named after the subdomain).
+	ClusterKey string
 }
 
 // TracingConfig is the per-route tracing configuration parsed from the
@@ -101,8 +109,14 @@ func (r Route) String() string {
 	return fmt.Sprintf("%s (%s, %d endpoint(s), from %s)", r.Subdomain, r.Source, len(r.Endpoints), r.Origin)
 }
 
-// ClusterName returns the Envoy cluster/route name for this route. Since
-// subdomains must be globally unique, the subdomain is used directly.
+// ClusterName returns the Envoy cluster/route name for this route. The
+// highest-precedence route of a subdomain keeps the legacy behavior (the
+// subdomain itself, which is unique per snapshot); a preserved
+// lower-precedence route sharing that subdomain carries its own derived
+// name in ClusterKey so both routes get distinct clusters/endpoints.
 func (r Route) ClusterName() string {
+	if r.ClusterKey != "" {
+		return r.ClusterKey
+	}
 	return r.Subdomain
 }

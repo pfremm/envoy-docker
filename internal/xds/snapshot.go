@@ -575,8 +575,25 @@ func buildHTTPSRouteConfiguration(routes map[string]model.Route, names []string,
 	// an unconstrained prefix-/ route with no host discrimination, so the
 	// first legacy route would capture traffic for every sibling legacy
 	// subdomain (cross-host traffic bleed).
+	//
+	// Several DISTINCT legacy routers may share one subdomain (discovery
+	// preserves them all so precedence is decided here, not there). They
+	// must collapse into ONE virtual host ordered by precedence: two
+	// virtual hosts with the same domain in one route configuration is a
+	// duplicate-domain error Envoy rejects, which would wedge the whole
+	// snapshot.
+	legacyByHost := map[string][]model.Route{}
+	legacyHosts := make([]string, 0, len(legacy))
 	for _, route := range legacy {
-		vh := buildVirtualHost(subdomainHost(route, baseDomain), []model.Route{route}, logger)
+		host := subdomainHost(route, baseDomain)
+		if _, seen := legacyByHost[host]; !seen {
+			legacyHosts = append(legacyHosts, host)
+		}
+		legacyByHost[host] = append(legacyByHost[host], route)
+	}
+	sort.Strings(legacyHosts)
+	for _, host := range legacyHosts {
+		vh := buildVirtualHost(host, model.SortByPrecedence(legacyByHost[host]), logger)
 		if vh != nil {
 			vhosts = append(vhosts, vh)
 		}
