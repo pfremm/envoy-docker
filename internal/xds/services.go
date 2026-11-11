@@ -322,7 +322,7 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 	// entrypoint gets its own TLS listener on its configured port, serving
 	// its own RDS route config.
 	listeners := []cachetypes.Resource{
-		buildHTTPListener(cfg.HTTPPort),
+		buildHTTPListener(cfg.HTTPPort, cfg.HTTPSPort),
 		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan),
 	}
 	for _, ep := range entrypointNames {

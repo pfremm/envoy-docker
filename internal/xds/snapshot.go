@@ -271,7 +271,7 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 	// entrypoint gets its own TLS listener on its configured port, serving
 	// its own RDS route config.
 	listeners := []cachetypes.Resource{
-		buildHTTPListener(cfg.HTTPPort),
+		buildHTTPListener(cfg.HTTPPort, cfg.HTTPSPort),
 		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan),
 	}
 	for _, ep := range entrypointNames {
@@ -616,6 +616,13 @@ func buildHTTPSRouteConfiguration(routes map[string]model.Route, names []string,
 	return &routev3.RouteConfiguration{
 		Name:         httpsRouteConfigName,
 		VirtualHosts: vhosts,
+		// Envoy matches the full :authority, including a non-standard
+		// port, unless told otherwise. With HTTPS on a port other than
+		// 443 (e.g. HTTPS_PORT=8443 behind a host port mapping), every
+		// request's authority carries :port and would 404 against these
+		// exact-domain virtual hosts. Strip the port for matching so
+		// behavior is identical on standard and non-standard ports.
+		IgnorePortInHostMatching: true,
 	}
 }
 
@@ -1007,7 +1014,16 @@ func buildRouteMatchFromTerm(term model.DNFTerm) (*routev3.RouteMatch, error) {
 
 // buildHTTPListener returns the plain-HTTP listener that unconditionally
 // redirects every request to HTTPS on the same host.
-func buildHTTPListener(port uint32) *listenerv3.Listener {
+func buildHTTPListener(port, httpsPort uint32) *listenerv3.Listener {
+	// Redirect to HTTPS. When HTTPS runs on a different port than HTTP
+	// (e.g. 8080 -> 8443 behind host port mappings), a bare https://
+	// scheme rewrite would send clients back to the HTTP port; name the
+	// HTTPS port explicitly. When both are the same, leave PortRedirect
+	// unset (0) so the Location header stays clean.
+	var portRedirect uint32
+	if port != httpsPort {
+		portRedirect = httpsPort
+	}
 	routeConfig := &routev3.RouteConfiguration{
 		Name: "http_redirect_routes",
 		VirtualHosts: []*routev3.VirtualHost{
@@ -1022,6 +1038,7 @@ func buildHTTPListener(port uint32) *listenerv3.Listener {
 						Action: &routev3.Route_Redirect{
 							Redirect: &routev3.RedirectAction{
 								SchemeRewriteSpecifier: &routev3.RedirectAction_HttpsRedirect{HttpsRedirect: true},
+								PortRedirect:           portRedirect,
 							},
 						},
 					},
