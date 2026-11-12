@@ -45,7 +45,9 @@ import (
 // ENVOY_VALIDATE_DIR to keep the generated files (bootstrap.json, secrets,
 // certificate) for running Envoy by hand; a tls.crt/tls.key already present
 // there is used instead of a generated one. ENVOY_VALIDATE_HTTPS_PORT and
-// ENVOY_VALIDATE_HTTP_PORT override the listener ports (18443/18080).
+// ENVOY_VALIDATE_HTTP_PORT override the listener ports (18443/18080);
+// ENVOY_VALIDATE_UPSTREAM_PORT points every router at 127.0.0.1:<port>
+// (default 1, where nothing listens).
 func TestEnvoyValidatesSSOSnapshot(t *testing.T) {
 	envoyBin := os.Getenv("ENVOY_BIN")
 	if envoyBin == "" {
@@ -84,17 +86,20 @@ func TestEnvoyValidatesSSOSnapshot(t *testing.T) {
 		t.Fatalf("SSO config invalid: %v %v", ssoCfg.LoadErr, ssoCfg.Invalid)
 	}
 
-	// Upstreams point at a port nothing listens on.
+	upstreamPort := envPort(t, "ENVOY_VALIDATE_UPSTREAM_PORT", 1)
 	route := func(name, profile string) model.Route {
 		return model.Route{
 			Subdomain: name, RouterName: name, Source: model.SourceDocker, SSOProfile: profile,
-			Endpoints: []model.Endpoint{{Address: "127.0.0.1", Port: 1}},
+			Endpoints: []model.Endpoint{{Address: "127.0.0.1", Port: upstreamPort}},
 		}
 	}
+	wsoff := route("wsoff", "")
+	wsoff.WebSocketDisabled = true
 	snap, err := xds.BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{
 		"app":   route("app", "nas"),
 		"media": route("media", "media"),
 		"www":   route("www", ""),
+		"wsoff": wsoff,
 	}}, xds.Config{
 		BaseDomain: "example.com", HTTPPort: httpPort, HTTPSPort: httpsPort,
 		CertSecretName: "cert", ACMESDSClusterName: "acme", SSO: ssoCfg,

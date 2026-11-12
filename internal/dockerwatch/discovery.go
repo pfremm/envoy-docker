@@ -454,7 +454,7 @@ func discover(containers []container.Summary, defaultNetwork string, logger *slo
 			if effectiveNetwork == "" {
 				effectiveNetwork = defaultNetwork
 			}
-			route := model.Route{Subdomain: r.subdomain, Source: model.SourceDocker, Origin: name + "/" + rn, Rule: r.rule, RuleExpr: r.ruleExpr, Priority: r.priority, PrioritySet: r.prioritySet, RouterName: rn, ServiceName: r.service, Timeout: r.timeout, IdleTimeout: r.idleTimeout, Retry: r.retry, MiddlewareNames: append([]string(nil), r.middlewares...), Middlewares: resolvedMiddlewares, DiscoveryNetwork: effectiveNetwork, Entrypoints: append([]string(nil), r.entrypoints...), SSOProfile: r.ssoProfile}
+			route := model.Route{Subdomain: r.subdomain, Source: model.SourceDocker, Origin: name + "/" + rn, Rule: r.rule, RuleExpr: r.ruleExpr, Priority: r.priority, PrioritySet: r.prioritySet, RouterName: rn, ServiceName: r.service, Timeout: r.timeout, IdleTimeout: r.idleTimeout, WebSocketDisabled: r.websocketDisabled, Retry: r.retry, MiddlewareNames: append([]string(nil), r.middlewares...), Middlewares: resolvedMiddlewares, DiscoveryNetwork: effectiveNetwork, Entrypoints: append([]string(nil), r.entrypoints...), SSOProfile: r.ssoProfile}
 			if r.tracingSet || r.operationName != "" {
 				route.Tracing = &model.TracingConfig{Enabled: r.tracing, OperationName: r.operationName}
 			}
@@ -570,7 +570,7 @@ func routesCompatible(a, b model.Route) bool {
 	if a.RuleExpr != b.RuleExpr || a.ServiceName != b.ServiceName || a.Priority != b.Priority ||
 		a.PrioritySet != b.PrioritySet || a.DiscoveryNetwork != b.DiscoveryNetwork ||
 		!reflect.DeepEqual(a.MiddlewareNames, b.MiddlewareNames) ||
-		!reflect.DeepEqual(a.Timeout, b.Timeout) || !reflect.DeepEqual(a.IdleTimeout, b.IdleTimeout) || !reflect.DeepEqual(a.Retry, b.Retry) ||
+		!reflect.DeepEqual(a.Timeout, b.Timeout) || !reflect.DeepEqual(a.IdleTimeout, b.IdleTimeout) || a.WebSocketDisabled != b.WebSocketDisabled || !reflect.DeepEqual(a.Retry, b.Retry) ||
 		!reflect.DeepEqual(a.Entrypoints, b.Entrypoints) || !reflect.DeepEqual(a.Tracing, b.Tracing) || !reflect.DeepEqual(a.AccessLog, b.AccessLog) || a.SSOProfile != b.SSOProfile {
 		return false
 	}

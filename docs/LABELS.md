@@ -30,6 +30,7 @@ number of routers.
 | `envoy.http.routers.<name>.middlewares` | no | Ordered comma/escape list of named HTTP middleware. See [HTTP middleware](#http-middleware). |
 | `envoy.http.routers.<name>.timeout` | no | Total upstream request timeout as a Go duration (`30s`, `500ms`). `0s` disables Envoy's route timeout. |
 | `envoy.http.routers.<name>.idletimeout` | no | Per-route stream idle timeout as a Go duration. `0s` disables it. Unset uses Envoy's 5m default; see [Protocol support](#protocol-support-http2-http3-websockets) for long-lived streams. |
+| `envoy.http.routers.<name>.websocket` | no | `true`\|`false`. WebSocket upgrades are proxied by default; `false` makes Envoy reject `Upgrade: websocket` requests to this router with 403 (ordinary requests are unaffected). See [Protocol support](#protocol-support-http2-http3-websockets). |
 | `envoy.http.routers.<name>.retries.attempts` | no | Positive total attempt count, including the initial request. Envoy receives `attempts-1` retries; `1` means no retry. |
 | `envoy.http.routers.<name>.retries.pertrytimeout` | no | Positive timeout for each try. |
 | `envoy.http.routers.<name>.retries.retryon` | no | Envoy retry conditions, for example `5xx,reset,connect-failure`. |
@@ -753,20 +754,52 @@ What the generated listeners speak today, from `buildHTTPSListener` and
 | Downstream HTTP/2 | **Not negotiated.** The HTTPS listeners' TLS context sets no `alpn_protocols`, so Envoy offers no `h2` in ALPN and browsers and ordinary clients fall back to HTTP/1.1. The HTTP connection managers leave `codec_type` unset (`AUTO`), so a client sending the HTTP/2 preface with prior knowledge (`curl --http2-prior-knowledge`) would still be understood. Do not rely on that: standard gRPC clients require `h2` via ALPN, so native gRPC from outside does not work (use the [grpcweb middleware](#http-middleware) over HTTP/1.1 instead). Advertising `h2` is future work. |
 | Upstream HTTP/2 / gRPC | Supported per named service with `envoy.http.services.<svc>.loadbalancer.protocol: http2` or `grpc`, which enables HTTP/2 on that service's cluster. Legacy port-only routers always use HTTP/1.1 upstream. This is independent of the downstream protocol. |
 | HTTP/3 / QUIC | **Not supported.** No UDP/QUIC listeners are generated and no `alt-svc` header is sent, so clients never attempt HTTP/3. |
-| WebSockets | **Not supported yet.** Neither the HTTP connection managers nor the routes set `upgrade_configs`, and Envoy refuses upgrades that are not configured: a request with `Upgrade: websocket` is rejected with 403 instead of being proxied. Enabling `websocket` upgrades is future work. |
+| WebSockets | **Supported, on by default** (as in Traefik). Every routed HTTPS connection manager (the default entrypoint and each named entrypoint) sets `upgrade_configs: [{upgrade_type: websocket}]`, so an HTTP/1.1 `Upgrade: websocket` request gets the upstream's `101 Switching Protocols` and frames flow both ways. The plain-HTTP listener only redirects to HTTPS and does not proxy upgrades. Opt a router out with `envoy.http.routers.<r>.websocket: "false"`: its routes set a route-level `upgrade_configs: [{upgrade_type: websocket, enabled: false}]` and Envoy answers upgrades with **403**. Once upgraded, the route `timeout` (default 15s) no longer applies, but the stream idle timeout does (see below). WebSockets over HTTP/2 (RFC 8441 extended CONNECT) are not enabled, so clients upgrade over HTTP/1.1. See the notes below for SSO and middleware. |
 
 **Long-lived streams and `idletimeout`.** The connection managers do not set
 `stream_idle_timeout`, so Envoy's default of **5 minutes** applies: a stream
 with no request or response activity for 5 minutes is closed (408 if no
 response headers were sent yet, otherwise a reset). For routers serving
 long-lived, mostly quiet responses (Server-Sent Events, long polling, large
-slow downloads, and WebSockets once supported), set
+slow downloads, and WebSockets), set
 `envoy.http.routers.<r>.idletimeout: "0s"` to disable the route's idle timeout,
 or set a value longer than the longest expected silence. The route `timeout`
 (Envoy default 15s) is a separate limit: it runs from the end of the request
 until the response is complete, so a streaming response that lasts longer is
 cut off unless `envoy.http.routers.<r>.timeout: "0s"` (or a large value) is
 also set.
+
+**WebSocket sessions and timeouts.** The route `timeout` stops applying once
+the upgrade completes: with default labels a session stays up well past 15s
+(verified on Envoy 1.37 with 30s sessions, including a single 21s gap with no
+frames). The idle timeout still applies to the upgraded stream: frames in either direction
+reset it, and a session silent for longer than the idle timeout (5m by
+default) is closed. Either have the application send pings more often than
+the idle timeout (most WebSocket libraries can), or set
+`envoy.http.routers.<r>.idletimeout` to a longer value (or `"0s"` to disable it).
+
+**WebSockets and SSO.** The oauth2 filter handles the upgrade request like
+any other request:
+
+- Browsers send cookies on a same-origin WebSocket handshake, so a page
+  loaded after SSO login can open a WebSocket to the same host and the
+  oauth2 session cookie authenticates it.
+- An unauthenticated upgrade gets the oauth2 filter's `302` to the IdP, not
+  a `101`. A WebSocket client cannot follow that redirect; the browser just
+  reports a failed connection. Load a page on the host first so the login
+  happens there.
+- Browsers cannot set an `Authorization` header on a WebSocket, so the
+  Bearer/`jwt_authn` path only helps non-browser clients. Those can send
+  `Authorization: Bearer <JWT>` on the handshake. An invalid token gets
+  `401` from `jwt_authn`.
+
+**WebSockets and middleware.** Header, path, CORS, auth, IP and rate-limit
+middlewares act on the handshake request only. The `compress` filters leave
+the `101` response and the frames alone (verified). The `buffering`
+middleware does not work with upgrades: Envoy's buffer filter waits for the
+end of the request body, which never comes on an upgrade, so the handshake
+hangs. Set `websocket: "false"` on buffered routers, or do not combine
+buffering with WebSocket routes.
 
 ## Observability hooks
 

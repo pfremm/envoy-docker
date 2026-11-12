@@ -408,3 +408,35 @@ func TestDiscoverDuplicateRouterNamesAcrossContainers(t *testing.T) {
 		t.Fatalf("same-subdomain replicas should merge endpoints, got %+v", cfg2.Routes)
 	}
 }
+
+func TestParseRouters_WebSocket(t *testing.T) {
+	got, bad, err := parseRouters(map[string]string{
+		"envoy.http.routers.def.subdomain": "def",
+		"envoy.http.routers.def.port":      "8080",
+		"envoy.http.routers.on.subdomain":  "on",
+		"envoy.http.routers.on.port":       "8081",
+		"envoy.http.routers.on.websocket":  "true",
+		"envoy.http.routers.off.subdomain": "off",
+		"envoy.http.routers.off.port":      "8082",
+		"envoy.http.routers.off.websocket": "false",
+		"envoy.http.routers.bad.subdomain": "bad",
+		"envoy.http.routers.bad.port":      "8083",
+		"envoy.http.routers.bad.websocket": "nope",
+	})
+	if err != nil {
+		t.Fatalf("parseRouters() unexpected error: %v", err)
+	}
+	if got["def"].websocketDisabled || got["on"].websocketDisabled {
+		t.Errorf("websocket unset/true must leave upgrades enabled: def=%v on=%v", got["def"].websocketDisabled, got["on"].websocketDisabled)
+	}
+	if !got["off"].websocketDisabled {
+		t.Errorf("websocket=false must disable upgrades")
+	}
+	// An invalid bool rejects only that router, like .tracing/.accesslog.
+	if _, ok := bad["bad"]; !ok {
+		t.Errorf("expected router %q in badRouters, got %v", "bad", bad)
+	}
+	if _, ok := got["bad"]; ok {
+		t.Errorf("router %q should be rejected", "bad")
+	}
+}

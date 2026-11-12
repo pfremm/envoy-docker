@@ -755,6 +755,7 @@ func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Rout
 		}
 		applyRouteSecurity(er, route.Middlewares)
 		applyRouteObservability(er, route)
+		applyRouteWebSocket(er, route)
 		return []*routev3.Route{er}
 	}
 
@@ -811,9 +812,29 @@ func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Rout
 		}
 		applyRouteSecurity(er, route.Middlewares)
 		applyRouteObservability(er, route)
+		applyRouteWebSocket(er, route)
 		out = append(out, er)
 	}
 	return out
+}
+
+// websocketUpgradeType is the HTTP/1.1 Upgrade token Envoy matches
+// upgrade_configs against.
+const websocketUpgradeType = "websocket"
+
+// applyRouteWebSocket disables the websocket upgrade on a route whose router
+// set .websocket=false. Routers that leave it unset (or true) carry no
+// route-level upgrade config and inherit the HCM default (enabled).
+func applyRouteWebSocket(er *routev3.Route, route model.Route) {
+	if !route.WebSocketDisabled {
+		return
+	}
+	if ra := er.GetRoute(); ra != nil {
+		ra.UpgradeConfigs = []*routev3.RouteAction_UpgradeConfig{{
+			UpgradeType: websocketUpgradeType,
+			Enabled:     wrapperspb.Bool(false),
+		}}
+	}
 }
 
 func routeResourceName(route model.Route) string {
@@ -1149,6 +1170,10 @@ func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certS
 			},
 		},
 		HttpFilters: filters,
+		// WebSocket upgrades are proxied by default (as Traefik does);
+		// routers opt out with .websocket=false (applyRouteWebSocket).
+		// Without this, Envoy rejects `Upgrade: websocket` with 403.
+		UpgradeConfigs: []*hcmv3.HttpConnectionManager_UpgradeConfig{{UpgradeType: websocketUpgradeType}},
 	}
 	if plan.xffNumTrustedHops > 0 {
 		// Honor the ipstrategy.depth of the IP allow/deny middleware: trust

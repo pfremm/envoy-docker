@@ -59,6 +59,10 @@ type Route struct {
 	Timeout     *time.Duration
 	IdleTimeout *time.Duration
 	Retry       *RetryPolicy
+	// WebSocketDisabled is the .websocket=false opt-out. WebSocket upgrades
+	// are enabled on every HTTP connection manager by default; when set, the
+	// router's routes disable the websocket upgrade at route level.
+	WebSocketDisabled bool
 	// MiddlewareNames preserves the router label's explicit chain. Middlewares
 	// contains the validated typed definitions in the same execution order.
 	MiddlewareNames []string

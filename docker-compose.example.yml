@@ -160,8 +160,11 @@ services:
       # route's stream idle timeout (Envoy default 5m) and the route timeout:
       #   envoy.http.routers.files.idletimeout: "0s"
       #   envoy.http.routers.files.timeout: "0s"
-      # WebSocket upgrades are not proxied yet (see docs/LABELS.md
-      # "Protocol support"); the same idletimeout advice will apply to them.
+      # WebSocket upgrades are proxied by default. The 15s route timeout does
+      # not cut an upgraded session, but the 5m idle timeout does: send pings
+      # more often than that or raise idletimeout as above. Opt a router out
+      # (upgrades get 403) with:
+      #   envoy.http.routers.files.websocket: "false"
     networks:
       - proxy
 

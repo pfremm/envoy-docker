@@ -151,7 +151,10 @@ type parsedRouter struct {
 	timeout     *time.Duration
 	idleTimeout *time.Duration
 	retry       *model.RetryPolicy
-	middlewares []string
+	// websocketDisabled is set by .websocket=false (upgrades are on by
+	// default).
+	websocketDisabled bool
+	middlewares       []string
 	// entrypoints is the .entrypoints label: the HTTP entrypoint names this
 	// router is served on. Empty means the default HTTP/HTTPS entrypoints.
 	entrypoints []string
@@ -237,6 +240,13 @@ func parseRouters(labels map[string]string) (map[string]parsedRouter, map[string
 				continue
 			}
 			r.idleTimeout = &d
+		case "websocket":
+			b, err := parseBoolLabel(key, value)
+			if err != nil {
+				badRouters[name] = err
+				continue
+			}
+			r.websocketDisabled = !b
 		case "retries.attempts":
 			n, err := strconv.ParseUint(value, 10, 32)
 			if err != nil || n == 0 {

@@ -285,6 +285,7 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 				}
 				applyRouteSecurity(er, r.Middlewares)
 				applyRouteObservability(er, r)
+				applyRouteWebSocket(er, r)
 			}
 		}
 		if len(cbRouteOverride) > 0 {
