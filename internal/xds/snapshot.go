@@ -1192,6 +1192,13 @@ func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certS
 
 	tlsContext := &tlsv3.DownstreamTlsContext{
 		CommonTlsContext: &tlsv3.CommonTlsContext{
+			// Offer HTTP/2. This is safe with HTTP/2 connection coalescing:
+			// the listener has a single filter chain and HCM, and routes
+			// every request by :authority through one route config, so a
+			// connection a browser reuses for another host covered by the
+			// certificate still reaches that host's virtual host.
+			// WebSocket clients negotiate http/1.1 and upgrade there.
+			AlpnProtocols: []string{"h2", "http/1.1"},
 			TlsCertificateSdsSecretConfigs: []*tlsv3.SdsSecretConfig{
 				{
 					Name:      certSecretName,

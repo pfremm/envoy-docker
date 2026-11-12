@@ -5,6 +5,7 @@ import (
 
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
@@ -119,5 +120,36 @@ func TestWebSocket_RouterOptOut(t *testing.T) {
 				t.Errorf("router multi emitted %d routes, want 2 (one per DNF term)", multi)
 			}
 		})
+	}
+}
+
+func TestHTTPSListenersAdvertiseH2(t *testing.T) {
+	routes := map[string]model.Route{
+		"app":   {Subdomain: "app", Endpoints: []model.Endpoint{{Address: "10.0.0.1", Port: 8080}}, Source: model.SourceDocker},
+		"admin": {Subdomain: "admin", Endpoints: []model.Endpoint{{Address: "10.0.0.2", Port: 8080}}, Source: model.SourceDocker, Entrypoints: []string{"admin"}},
+	}
+	cfg := Config{
+		BaseDomain: "example.com", HTTPPort: 80, HTTPSPort: 443,
+		CertSecretName: "cert", ACMESDSClusterName: "acme",
+		HTTPEntrypoints: map[string]uint32{"admin": 8443},
+	}
+	snap, err := BuildSnapshot("1", routes, cfg)
+	if err != nil {
+		t.Fatalf("BuildSnapshot() unexpected error: %v", err)
+	}
+	listeners := snap.GetResources(resourcev3.ListenerType)
+	for _, name := range []string{httpsListenerName, httpsListenerName + "__admin"} {
+		l := listeners[name].(*listenerv3.Listener)
+		// Coalescing safety relies on one filter chain (no per-SNI chains).
+		if len(l.FilterChains) != 1 || l.FilterChains[0].FilterChainMatch != nil {
+			t.Fatalf("listener %q must have exactly one unconditional filter chain, got %v", name, l.FilterChains)
+		}
+		tlsCtx := &tlsv3.DownstreamTlsContext{}
+		if err := l.FilterChains[0].TransportSocket.GetTypedConfig().UnmarshalTo(tlsCtx); err != nil {
+			t.Fatalf("listener %q TLS context: %v", name, err)
+		}
+		if got := tlsCtx.GetCommonTlsContext().GetAlpnProtocols(); len(got) != 2 || got[0] != "h2" || got[1] != "http/1.1" {
+			t.Errorf("listener %q alpn_protocols = %v, want [h2 http/1.1]", name, got)
+		}
 	}
 }
