@@ -334,7 +334,9 @@ func ssoHTTPFilters(profiles []sso.Profile) []*hcmv3.HttpFilter {
 // always uses PKCE (code_verifier cookie) for the authorization code flow,
 // so public clients work without a client secret; the token_secret SDS file
 // then only needs to hold a dummy generic secret, because OAuth2Credentials
-// requires the field.
+// requires the field. OAuth2Credentials.token_secret is Envoy's only
+// client-secret slot, so a confidential client's credentials.client_secret
+// is emitted there (taking precedence over token_secret).
 func oauth2Config(p sso.Profile) *oauth2v3.OAuth2 {
 	suffix := "-" + p.Name
 	return &oauth2v3.OAuth2{Config: &oauth2v3.OAuth2Config{
@@ -342,7 +344,7 @@ func oauth2Config(p sso.Profile) *oauth2v3.OAuth2 {
 		AuthorizationEndpoint: p.AuthorizationEndpoint,
 		Credentials: &oauth2v3.OAuth2Credentials{
 			ClientId:       p.ClientID,
-			TokenSecret:    sdsFileSecret(p.TokenSecret),
+			TokenSecret:    sdsFileSecret(p.ClientSecretRef()),
 			TokenFormation: &oauth2v3.OAuth2Credentials_HmacSecret{HmacSecret: sdsFileSecret(p.HMACSecret)},
 			CookieDomain:   p.CookieDomain,
 			// Per-profile cookie names: several profiles may share one

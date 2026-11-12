@@ -64,10 +64,21 @@ func TestEnvoyValidatesSSOSnapshot(t *testing.T) {
 	httpPort := envPort(t, "ENVOY_VALIDATE_HTTP_PORT", 18080)
 
 	ssoDoc := "sso_profiles:\n"
-	for _, p := range []struct{ name, paths string }{
-		{"nas", ""},
-		{"media", "    redirect_path: /oauth2/media/callback\n    signout_path: /oauth2/media/signout\n"},
+	// nas is a public client (dummy token_secret); media is a confidential
+	// client whose credentials.client_secret becomes OAuth2 token_secret.
+	for _, p := range []struct {
+		name, paths  string
+		confidential bool
+	}{
+		{"nas", "", false},
+		{"media", "    redirect_path: /oauth2/media/callback\n    signout_path: /oauth2/media/signout\n", true},
 	} {
+		creds := fmt.Sprintf("    credentials: {client_id: envoy-%[1]s}\n    token_secret: {name: sso-%[1]s-token, sds_path: %[2]s/sso-%[1]s-token.yaml}\n", p.name, dir)
+		secretName, secretValue := "sso-"+p.name+"-token", "dummy-"+p.name
+		if p.confidential {
+			creds = fmt.Sprintf("    credentials:\n      client_id: envoy-%[1]s\n      client_secret: {name: sso-%[1]s-client, sds_path: %[2]s/sso-%[1]s-client.yaml}\n", p.name, dir)
+			secretName, secretValue = "sso-"+p.name+"-client", "client-secret-"+p.name
+		}
 		ssoDoc += fmt.Sprintf(`  %[1]s:
     redirect_uri_host: sso.example.com
 %[2]s    cookie_domain: example.com
@@ -75,16 +86,17 @@ func TestEnvoyValidatesSSOSnapshot(t *testing.T) {
     authorization_endpoint: https://auth.example.com/application/o/authorize/
     token_endpoint: {cluster: sso_idp, uri: https://auth.example.com/application/o/token/}
     jwks: {cluster: sso_idp, uri: https://auth.example.com/application/o/%[1]s/jwks/}
-    credentials: {client_id: envoy-%[1]s}
-    hmac_secret:  {name: sso-%[1]s-hmac,  sds_path: %[3]s/sso-%[1]s-hmac.yaml}
-    token_secret: {name: sso-%[1]s-token, sds_path: %[3]s/sso-%[1]s-token.yaml}
-`, p.name, p.paths, dir)
+%[4]s    hmac_secret:  {name: sso-%[1]s-hmac,  sds_path: %[3]s/sso-%[1]s-hmac.yaml}
+`, p.name, p.paths, dir, creds)
 		writeGenericSecret(t, filepath.Join(dir, "sso-"+p.name+"-hmac.yaml"), "sso-"+p.name+"-hmac", "0123456789abcdef0123456789abcdef")
-		writeGenericSecret(t, filepath.Join(dir, "sso-"+p.name+"-token.yaml"), "sso-"+p.name+"-token", "client-secret-"+p.name)
+		writeGenericSecret(t, filepath.Join(dir, secretName+".yaml"), secretName, secretValue)
 	}
 	ssoCfg := sso.Parse("sso.yaml", []byte(ssoDoc))
 	if ssoCfg.LoadErr != nil || len(ssoCfg.Invalid) != 0 {
 		t.Fatalf("SSO config invalid: %v %v", ssoCfg.LoadErr, ssoCfg.Invalid)
+	}
+	if p := ssoCfg.Profiles["media"]; !p.HasClientSecret() || p.ClientSecretRef().Name != "sso-media-client" {
+		t.Fatalf("media profile is not confidential: %+v", p)
 	}
 
 	upstreamPort := envPort(t, "ENVOY_VALIDATE_UPSTREAM_PORT", 1)

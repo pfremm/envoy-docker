@@ -93,9 +93,41 @@ type Profile struct {
 	JWKSCacheDuration     time.Duration
 	ClientID              string
 	HMACSecret            Secret
-	TokenSecret           Secret
-	AuthScopes            []string
-	PassThrough           PassThroughMatcher
+	// TokenSecret is unset (zero) when ClientSecret is set and the
+	// token_secret field was omitted.
+	TokenSecret Secret
+	// ClientSecret is the confidential client's secret (zero for a public
+	// client).
+	ClientSecret Secret
+	AuthScopes   []string
+	PassThrough  PassThroughMatcher
+}
+
+// HasClientSecret reports whether the profile is a confidential client
+// configured with credentials.client_secret.
+func (p Profile) HasClientSecret() bool {
+	return p.ClientSecret.Name != ""
+}
+
+// ClientSecretRef is the secret emitted as OAuth2Credentials.token_secret
+// (Envoy's only client-secret slot): credentials.client_secret when set,
+// otherwise token_secret.
+func (p Profile) ClientSecretRef() Secret {
+	if p.HasClientSecret() {
+		return p.ClientSecret
+	}
+	return p.TokenSecret
+}
+
+// secrets lists every configured secret reference of the profile.
+func (p Profile) secrets() []Secret {
+	out := []Secret{p.HMACSecret}
+	for _, s := range []Secret{p.TokenSecret, p.ClientSecret} {
+		if s.Name != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // RedirectURI is the absolute OAuth2 callback URI.
@@ -199,6 +231,9 @@ type profileYAML struct {
 	JWKS                  *endpointYAML `yaml:"jwks"`
 	Credentials           *struct {
 		ClientID string `yaml:"client_id"`
+		// ClientSecret is decoded by hand (see parseClientSecret) so an
+		// inline secret value gets a clear error rather than a type error.
+		ClientSecret yaml.Node `yaml:"client_secret"`
 	} `yaml:"credentials"`
 	HMACSecret         *secretYAML `yaml:"hmac_secret"`
 	TokenSecret        *secretYAML `yaml:"token_secret"`
@@ -355,14 +390,41 @@ func parseProfile(name string, node *yaml.Node) (Profile, error) {
 	if p.HMACSecret, err = parseSecret("hmac_secret", y.HMACSecret); err != nil {
 		return Profile{}, err
 	}
-	// Envoy's OAuth2Credentials requires token_secret. For a confidential
-	// client its SDS file holds the client secret; for a public (PKCE-only)
-	// client it may hold a dummy generic secret.
-	if p.TokenSecret, err = parseSecret("token_secret", y.TokenSecret); err != nil {
+	if p.ClientSecret, err = parseClientSecret(&y.Credentials.ClientSecret); err != nil {
 		return Profile{}, err
 	}
-	if p.HMACSecret.Name == p.TokenSecret.Name {
-		return Profile{}, fmt.Errorf("hmac_secret and token_secret must use different secret names (both %q)", p.HMACSecret.Name)
+	// Envoy's OAuth2Credentials requires token_secret, which is the client
+	// secret sent to the token endpoint. A confidential client sets
+	// credentials.client_secret (emitted there instead); a public
+	// (PKCE-only) client points token_secret at a dummy generic secret.
+	// token_secret stays allowed (but unused) alongside client_secret so an
+	// existing deployment can add client_secret without removing it.
+	if y.TokenSecret != nil || !p.HasClientSecret() {
+		if y.TokenSecret == nil {
+			return Profile{}, fmt.Errorf("token_secret is required ({name, sds_path}) unless credentials.client_secret is set")
+		}
+		if p.TokenSecret, err = parseSecret("token_secret", y.TokenSecret); err != nil {
+			return Profile{}, err
+		}
+		if p.HMACSecret.Name == p.TokenSecret.Name {
+			return Profile{}, fmt.Errorf("hmac_secret and token_secret must use different secret names (both %q)", p.HMACSecret.Name)
+		}
+	}
+	if p.HasClientSecret() {
+		for _, o := range []struct {
+			field string
+			s     Secret
+		}{{"hmac_secret", p.HMACSecret}, {"token_secret", p.TokenSecret}} {
+			if o.s.Name == "" {
+				continue
+			}
+			if p.ClientSecret.Name == o.s.Name {
+				return Profile{}, fmt.Errorf("credentials.client_secret and %s must use different secret names (both %q)", o.field, o.s.Name)
+			}
+			if p.ClientSecret.SDSPath == o.s.SDSPath {
+				return Profile{}, fmt.Errorf("credentials.client_secret and %s must use different sds_path files (both %s)", o.field, o.s.SDSPath)
+			}
+		}
 	}
 
 	if y.AuthScopes == nil {
@@ -420,6 +482,31 @@ func parseSecret(field string, y *secretYAML) (Secret, error) {
 		return Secret{}, fmt.Errorf("%s.sds_path %q must be an absolute path (inside the Envoy container)", field, y.SDSPath)
 	}
 	return Secret{Name: strings.TrimSpace(y.Name), SDSPath: filepath.Clean(y.SDSPath)}, nil
+}
+
+// parseClientSecret decodes the optional credentials.client_secret
+// reference. Only an SDS file reference is accepted: any other shape (a
+// plain string, null, or extra keys such as secret/value) is rejected so
+// secret material can never be inlined in the profile file.
+func parseClientSecret(n *yaml.Node) (Secret, error) {
+	const field = "credentials.client_secret"
+	const noInline = "inline secrets are not supported; put the secret in an SDS file inside the Envoy container and reference it as {name, sds_path}"
+	if n.Kind == 0 {
+		return Secret{}, nil
+	}
+	if n.Kind != yaml.MappingNode {
+		return Secret{}, fmt.Errorf("%s must be a mapping {name, sds_path}: %s", field, noInline)
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if k := n.Content[i].Value; k != "name" && k != "sds_path" {
+			return Secret{}, fmt.Errorf("%s: unknown key %q (only name and sds_path are allowed): %s", field, k, noInline)
+		}
+	}
+	var y secretYAML
+	if err := n.Decode(&y); err != nil {
+		return Secret{}, fmt.Errorf("%s: %w", field, err)
+	}
+	return parseSecret(field, &y)
 }
 
 func parsePositiveDuration(v string) (time.Duration, error) {
@@ -492,7 +579,7 @@ func validateCrossProfile(cfg *Config) {
 				break
 			}
 		}
-		for _, s := range []Secret{p.HMACSecret, p.TokenSecret} {
+		for _, s := range p.secrets() {
 			if conflict != nil {
 				break
 			}
@@ -518,7 +605,7 @@ func validateCrossProfile(cfg *Config) {
 			clusterAuthority[e.Cluster] = e.Authority()
 			clusterOwner[e.Cluster] = p
 		}
-		for _, s := range []Secret{p.HMACSecret, p.TokenSecret} {
+		for _, s := range p.secrets() {
 			secretPath[s.Name] = s.SDSPath
 			secretOwner[s.Name] = name
 		}

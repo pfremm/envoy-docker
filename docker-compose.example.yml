@@ -75,10 +75,12 @@ services:
     volumes:
       - ./envoy/bootstrap.yaml.tmpl:/etc/envoy/bootstrap.yaml.tmpl:ro
       # File-based SDS secrets referenced by the SSO profiles' sds_path
-      # (sso-nas-hmac.yaml, sso-nas-token.yaml; format in docs/LABELS.md
-      # "SDS secret files"). Read by Envoy only; create both files before
-      # starting, or Envoy cannot bring up the HTTPS listener serving the
-      # SSO router.
+      # (sso-nas-hmac.yaml plus sso-nas-client.yaml for a confidential
+      # client or sso-nas-token.yaml for a public one; format in
+      # docs/LABELS.md "SDS secret files"). Read by Envoy only; create the
+      # files before starting, or Envoy cannot bring up the HTTPS listener
+      # serving the SSO router. They hold secrets: mode 0600, never
+      # committed (./secrets/ is git-ignored).
       - ./secrets/sso:/etc/envoy/secrets:ro
     ports:
       - "80:80"

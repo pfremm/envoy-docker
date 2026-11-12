@@ -17,7 +17,12 @@ sso_profiles:
     jwks: {cluster: sso_idp, uri: https://auth.example.com/application/o/nas/jwks/}  # cache_duration default 300s
     credentials:
       client_id: envoy-nas
+      # Confidential client (the IdP issued a secret, e.g. a Cognito app
+      # client with a secret): SDS file holding the real client secret.
+      client_secret: {name: sso-nas-client, sds_path: /etc/envoy/secrets/sso-nas-client.yaml}
     hmac_secret:  {name: sso-nas-hmac,  sds_path: /etc/envoy/secrets/sso-nas-hmac.yaml}
-    token_secret: {name: sso-nas-token, sds_path: /etc/envoy/secrets/sso-nas-token.yaml}
+    # Public (PKCE-only) client instead: omit client_secret and point
+    # token_secret at a dummy generic secret (Envoy requires one).
+    # token_secret: {name: sso-nas-token, sds_path: /etc/envoy/secrets/sso-nas-token.yaml}
     auth_scopes: [openid, email]              # optional (default shown)
     pass_through_matcher: {header: authorization, prefix: "Bearer "}  # optional (default shown)

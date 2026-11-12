@@ -232,3 +232,128 @@ func TestLookup_ProfileNamesAreCaseSensitive(t *testing.T) {
 		t.Errorf("Lookup(NAS) error = %q, want not-defined error listing the defined profiles", err)
 	}
 }
+
+// withClientSecret returns validProfileYAML with credentials.client_secret
+// set to cs (raw YAML after "client_secret:"), optionally dropping
+// token_secret.
+func withClientSecret(t *testing.T, cs string, dropToken bool) string {
+	t.Helper()
+	body := replaceIn(t, "client_id: envoy-nas", "client_id: envoy-nas\n      client_secret: "+cs)
+	if dropToken {
+		const tok = "    token_secret: {name: sso-nas-token, sds_path: /etc/envoy/secrets/sso-nas-token.yaml}\n"
+		if !strings.Contains(body, tok) {
+			t.Fatalf("fixture does not contain %q", tok)
+		}
+		body = strings.Replace(body, tok, "", 1)
+	}
+	return body
+}
+
+func TestParseProfile_ClientSecretRejected(t *testing.T) {
+	const okRef = "{name: sso-nas-client, sds_path: /etc/envoy/secrets/sso-nas-client.yaml}"
+	cases := []struct {
+		name      string
+		cs        string
+		dropToken bool
+		want      []string
+	}{
+		{"missing name", "{sds_path: /etc/envoy/secrets/sso-nas-client.yaml}", false, []string{"credentials.client_secret.name is required"}},
+		{"blank name", "{name: '  ', sds_path: /etc/envoy/secrets/sso-nas-client.yaml}", false, []string{"credentials.client_secret.name is required"}},
+		{"missing sds_path", "{name: sso-nas-client}", false, []string{"credentials.client_secret.sds_path", "must be an absolute path"}},
+		{"relative sds_path", "{name: sso-nas-client, sds_path: secrets/c.yaml}", false, []string{"credentials.client_secret.sds_path", `"secrets/c.yaml"`, "must be an absolute path", "inside the Envoy container"}},
+		{"inline string", `"abc"`, false, []string{"credentials.client_secret", "inline secrets are not supported", "SDS file"}},
+		{"inline string without token_secret", "s3cr3t", true, []string{"credentials.client_secret", "inline secrets are not supported"}},
+		{"null", "", false, []string{"credentials.client_secret", "inline secrets are not supported"}},
+		{"sequence", "[a, b]", false, []string{"credentials.client_secret", "inline secrets are not supported"}},
+		{"extra secret key", "{name: sso-nas-client, sds_path: /etc/envoy/secrets/sso-nas-client.yaml, secret: abc}", false, []string{`unknown key "secret"`, "inline secrets are not supported"}},
+		{"extra value key", "{name: sso-nas-client, value: abc}", false, []string{`unknown key "value"`, "inline secrets are not supported"}},
+		{"name equals hmac", "{name: sso-nas-hmac, sds_path: /etc/envoy/secrets/sso-nas-client.yaml}", false, []string{"credentials.client_secret and hmac_secret must use different secret names"}},
+		{"name equals token", "{name: sso-nas-token, sds_path: /etc/envoy/secrets/sso-nas-client.yaml}", false, []string{"credentials.client_secret and token_secret must use different secret names"}},
+		{"path equals hmac", "{name: sso-nas-client, sds_path: /etc/envoy/secrets/sso-nas-hmac.yaml}", false, []string{"credentials.client_secret and hmac_secret must use different sds_path files"}},
+		{"path equals hmac uncleaned", "{name: sso-nas-client, sds_path: /etc/envoy//secrets/sso-nas-hmac.yaml}", true, []string{"credentials.client_secret and hmac_secret must use different sds_path files"}},
+		{"path equals token", "{name: sso-nas-client, sds_path: /etc/envoy/secrets/sso-nas-token.yaml}", false, []string{"credentials.client_secret and token_secret must use different sds_path files"}},
+		{"valid ref but bad token_secret", okRef, false, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := withClientSecret(t, tc.cs, tc.dropToken)
+			if tc.want == nil {
+				// token_secret is still validated when present.
+				body = strings.Replace(body, "sds_path: /etc/envoy/secrets/sso-nas-token.yaml", "sds_path: rel.yaml", 1)
+				tc.want = []string{"token_secret.sds_path", "must be an absolute path"}
+			}
+			assertProfileRejected(t, "myprof", body, tc.want...)
+		})
+	}
+}
+
+func TestParseProfile_ClientSecretAccepted(t *testing.T) {
+	client := Secret{Name: "sso-nas-client", SDSPath: "/etc/envoy/secrets/sso-nas-client.yaml"}
+	token := Secret{Name: "sso-nas-token", SDSPath: "/etc/envoy/secrets/sso-nas-token.yaml"}
+	const ref = "{name: sso-nas-client, sds_path: /etc/envoy/secrets/sso-nas-client.yaml}"
+	cases := []struct {
+		name          string
+		body          string
+		confidential  bool
+		wantToken     Secret
+		wantClientRef Secret
+	}{
+		{"public client (token_secret only)", validProfileYAML, false, token, token},
+		{"client_secret without token_secret", withClientSecret(t, ref, true), true, Secret{}, client},
+		{"client_secret takes precedence over token_secret", withClientSecret(t, ref, false), true, token, client},
+		{"block style", replaceIn(t, "client_id: envoy-nas", "client_id: envoy-nas\n      client_secret:\n        name: sso-nas-client\n        sds_path: /etc/envoy/secrets//sso-nas-client.yaml"), true, token, client},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Parse("sso.yaml", []byte(profileDoc("p", tc.body)))
+			p, err := cfg.Lookup("p")
+			if err != nil {
+				t.Fatalf("profile rejected: %v", err)
+			}
+			if p.HasClientSecret() != tc.confidential || p.TokenSecret != tc.wantToken || p.ClientSecretRef() != tc.wantClientRef {
+				t.Errorf("HasClientSecret=%v TokenSecret=%+v ClientSecretRef=%+v, want %v %+v %+v",
+					p.HasClientSecret(), p.TokenSecret, p.ClientSecretRef(), tc.confidential, tc.wantToken, tc.wantClientRef)
+			}
+		})
+	}
+}
+
+func TestParseProfile_NeitherClientNorTokenSecret(t *testing.T) {
+	body := replaceIn(t, "token_secret: {name: sso-nas-token, sds_path: /etc/envoy/secrets/sso-nas-token.yaml}", "")
+	assertProfileRejected(t, "myprof", body, "token_secret is required", "unless credentials.client_secret is set")
+}
+
+func TestParseCrossProfileClientSecretConflict(t *testing.T) {
+	a := withClientSecret(t, "{name: shared-client, sds_path: /etc/envoy/secrets/a-client.yaml}", true)
+	b := strings.ReplaceAll(validProfileYAML, "redirect_uri_host: sso.", "redirect_uri_host: sso2.")
+	b = strings.ReplaceAll(b, "sso-nas-", "sso-b-")
+	cases := []struct {
+		name, bBody string
+		wantErr     bool
+	}{
+		// b's client_secret reuses a's client secret name with another file.
+		{"client vs client", strings.Replace(b, "client_id: envoy-nas", "client_id: envoy-nas\n      client_secret: {name: shared-client, sds_path: /etc/envoy/secrets/b-client.yaml}", 1), true},
+		// b's token_secret reuses a's client secret name with another file.
+		{"token vs client", strings.Replace(b, "{name: sso-b-token,", "{name: shared-client,", 1), true},
+		// Same name and same file is a shared secret, which is fine.
+		{"same file", strings.Replace(b, "client_id: envoy-nas", "client_id: envoy-nas\n      client_secret: {name: shared-client, sds_path: /etc/envoy/secrets/a-client.yaml}", 1), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Parse("sso.yaml", []byte(profileDoc("a", a)+"  b:"+tc.bBody))
+			if _, err := cfg.Lookup("a"); err != nil {
+				t.Fatalf("first profile (sorted) must win: %v", err)
+			}
+			_, err := cfg.Lookup("b")
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("b rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), `secret "shared-client"`) || !strings.Contains(err.Error(), `profile "a" already maps it to /etc/envoy/secrets/a-client.yaml`) {
+				t.Fatalf("Lookup(b) = %v, want secret name conflict with profile a", err)
+			}
+		})
+	}
+}

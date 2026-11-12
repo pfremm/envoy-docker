@@ -1,12 +1,15 @@
 package xds
 
 import (
+	"bytes"
+	"log/slog"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	headermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
@@ -15,6 +18,7 @@ import (
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
 	"github.com/bryanpfremm/envoy-control-plane/internal/rule"
@@ -419,4 +423,96 @@ func mustRule(t *testing.T, expr string) model.Rule {
 		t.Fatalf("rule.Parse(%q): %v", expr, err)
 	}
 	return r
+}
+
+// expectedFileSDS is the SdsSecretConfig shape every SSO secret reference
+// must have: a name plus a v3 path_config_source pointing at the file.
+func expectedFileSDS(name, path string) *tlsv3.SdsSecretConfig {
+	return &tlsv3.SdsSecretConfig{
+		Name: name,
+		SdsConfig: &corev3.ConfigSource{
+			ResourceApiVersion:    corev3.ApiVersion_V3,
+			ConfigSourceSpecifier: &corev3.ConfigSource_PathConfigSource{PathConfigSource: &corev3.PathConfigSource{Path: path}},
+		},
+	}
+}
+
+func TestSSOSnapshot_ClientSecretEmittedAsTokenSecret(t *testing.T) {
+	const clientLine = "      client_id: envoy-nas\n      client_secret: {name: sso-nas-client, sds_path: /etc/envoy/secrets/sso-nas-client.yaml}\n"
+	const tokenLine = "    token_secret: {name: sso-nas-token, sds_path: /etc/envoy/secrets/sso-nas-token.yaml}\n"
+	public := ssoProfileYAML("nas", "sso-nas.example.com")
+	both := strings.Replace(public, "      client_id: envoy-nas\n", clientLine, 1)
+	clientOnly := strings.Replace(both, tokenLine, "", 1)
+	if both == public || clientOnly == both {
+		t.Fatalf("fixture edits did not apply")
+	}
+	token := expectedFileSDS("sso-nas-token", "/etc/envoy/secrets/sso-nas-token.yaml")
+	client := expectedFileSDS("sso-nas-client", "/etc/envoy/secrets/sso-nas-client.yaml")
+	cases := []struct {
+		name, profile string
+		want          *tlsv3.SdsSecretConfig
+	}{
+		{"public client unchanged", public, token},
+		{"client_secret takes precedence", both, client},
+		{"client_secret only", clientOnly, client},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ssoCfg := sso.Parse("sso.yaml", []byte("sso_profiles:"+tc.profile))
+			if ssoCfg.LoadErr != nil || len(ssoCfg.Invalid) != 0 {
+				t.Fatalf("SSO config invalid: %v %v", ssoCfg.LoadErr, ssoCfg.Invalid)
+			}
+			snap, err := BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{"app": ssoRoute("app", "nas")}}, ssoTestConfig(ssoCfg))
+			if err != nil {
+				t.Fatalf("BuildSnapshotForConfig: %v", err)
+			}
+			hcm := httpsHCM(t, snap)
+			var oauth oauth2v3.OAuth2
+			unmarshalAny(t, hcm.HttpFilters[1].GetTypedConfig(), &oauth)
+			if err := oauth.ValidateAll(); err != nil {
+				t.Fatalf("oauth2 config fails proto validation: %v", err)
+			}
+			creds := oauth.Config.GetCredentials()
+			if !proto.Equal(creds.GetTokenSecret(), tc.want) {
+				t.Errorf("token_secret = %v, want %v", creds.GetTokenSecret(), tc.want)
+			}
+			if hmac := expectedFileSDS("sso-nas-hmac", "/etc/envoy/secrets/sso-nas-hmac.yaml"); !proto.Equal(creds.GetHmacSecret(), hmac) {
+				t.Errorf("hmac_secret = %v, want %v", creds.GetHmacSecret(), hmac)
+			}
+		})
+	}
+}
+
+func TestSSOSnapshot_BadClientSecretDropsOnlyThatProfile(t *testing.T) {
+	bad := strings.Replace(ssoProfileYAML("bad", "sso-bad.example.com"), "      client_id: envoy-bad\n",
+		"      client_id: envoy-bad\n      client_secret: \"inline-value\"\n", 1)
+	ssoCfg := sso.Parse("sso.yaml", []byte("sso_profiles:"+ssoProfileYAML("nas", "sso-nas.example.com")+bad))
+	if _, ok := ssoCfg.Invalid["bad"]; !ok || len(ssoCfg.Profiles) != 1 {
+		t.Fatalf("want only profile bad invalid, got profiles=%v invalid=%v", ssoCfg.SortedProfileNames(), ssoCfg.Invalid)
+	}
+	var logs bytes.Buffer
+	cfg := ssoTestConfig(ssoCfg)
+	cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	snap, err := BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{
+		"app":  ssoRoute("app", "nas"),
+		"evil": ssoRoute("evil", "bad"),
+		"www":  ssoRoute("www", ""),
+	}}, cfg)
+	if err != nil {
+		t.Fatalf("snapshot must still build: %v", err)
+	}
+	routes := routesByName(httpsRouteConfig(t, snap))
+	if _, ok := routes["evil"]; ok {
+		t.Errorf("router referencing the invalid profile must be rejected, not served public")
+	}
+	for _, r := range []string{"app", "www"} {
+		if _, ok := routes[r]; !ok {
+			t.Errorf("router %s must be unaffected", r)
+		}
+	}
+	for _, want := range []string{"skipping router: sso profile cannot be applied", "router=evil", `sso profile \"bad\" is invalid`, "inline secrets are not supported"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("warning log missing %q:\n%s", want, logs.String())
+		}
+	}
 }

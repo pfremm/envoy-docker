@@ -1,2 +1,3 @@
 /envoy-control-plane
 *.log
+/secrets/
