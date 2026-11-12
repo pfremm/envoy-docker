@@ -165,6 +165,9 @@ type parsedRouter struct {
 	// is its value.
 	accesslogSet bool
 	accesslog    bool
+	// ssoProfile is the .sso label: the operator SSO profile name. It is
+	// resolved against SSO_CONFIG_PATH at snapshot build time.
+	ssoProfile string
 }
 
 // parseRouters extracts envoy.http.routers.<name>.{subdomain,port,network,
@@ -317,6 +320,13 @@ func parseRouters(labels map[string]string) (map[string]parsedRouter, map[string
 			}
 			r.accesslogSet = true
 			r.accesslog = b
+		case "sso":
+			v := strings.TrimSpace(value)
+			if v == "" {
+				badRouters[name] = fmt.Errorf("router %q: sso cannot be empty (omit the label for a public router)", name)
+				continue
+			}
+			r.ssoProfile = v
 		default:
 			continue
 		}

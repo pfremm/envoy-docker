@@ -91,6 +91,11 @@ type Route struct {
 	// cluster instead of colliding on the shared subdomain name. Empty means
 	// the legacy behavior (cluster named after the subdomain).
 	ClusterKey string
+
+	// SSOProfile, when non-empty, is the .sso label: the name of an operator
+	// SSO profile (SSO_CONFIG_PATH) that puts this router's whole virtual
+	// host behind Envoy's oauth2 + jwt_authn filters. Empty means public.
+	SSOProfile string
 }
 
 // TracingConfig is the per-route tracing configuration parsed from the

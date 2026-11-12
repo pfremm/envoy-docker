@@ -33,6 +33,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
+	"github.com/bryanpfremm/envoy-control-plane/internal/sso"
 )
 
 const (
@@ -86,6 +87,10 @@ type Config struct {
 	// not wedge config updates for every other container. A nil Logger
 	// skips silently.
 	Logger *slog.Logger
+
+	// SSO is the operator's SSO profile config (SSO_CONFIG_PATH). Nil means
+	// SSO is not configured: routers with an .sso label are rejected.
+	SSO *sso.Config
 }
 
 // Merge combines docker-derived and static routes into one map keyed by
@@ -146,6 +151,7 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 		logger = cfg.Logger
 	}
 	routes = dedupeRouteNames(routes, logger)
+	routes = filterSSORoutes(routes, cfg, logger)
 	byEntrypoint, entrypointNames := groupRoutesByEntrypoint(routes, cfg, logger)
 
 	// One RDS route configuration per entrypoint. The default entrypoint
@@ -264,7 +270,21 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 		}
 	}
 
+	// SSO runs after the error-service virtual hosts exist (so they get the
+	// disabled overrides too) and before the security defaults (so the
+	// synthesized callback routes get the ext_authz disabled override).
+	ssoP := planSSO(routeConfigs, published, cfg, logger)
+	for _, c := range ssoP.clusters {
+		if owner, exists := clusterOwners[c.Name]; exists {
+			return nil, fmt.Errorf("xDS cluster name %q collides between %s and an SSO profile IdP cluster", c.Name, owner)
+		}
+		clusterOwners[c.Name] = "SSO profile IdP cluster"
+		clusters = append(clusters, c)
+	}
 	applySecurityDefaultsToAll(routeConfigs, plan)
+	for _, rc := range routeConfigs {
+		applyHSTS(rc)
+	}
 
 	// The default entrypoint's listeners are the legacy http_listener (plain
 	// HTTP -> HTTPS redirect) and https_listener (TLS, RDS). Each extra
@@ -272,7 +292,7 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 	// its own RDS route config.
 	listeners := []cachetypes.Resource{
 		buildHTTPListener(cfg.HTTPPort, cfg.HTTPSPort),
-		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan),
+		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName]),
 	}
 	for _, ep := range entrypointNames {
 		if ep == defaultEntrypointName {
@@ -284,7 +304,7 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 		}
 		listeners = append(listeners, buildHTTPSListener(
 			httpsListenerName+"__"+ep, port, httpsRouteConfigName+"__"+ep,
-			cfg.CertSecretName, cfg.ACMESDSClusterName, plan))
+			cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName+"__"+ep]))
 	}
 
 	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg, logger)
@@ -1075,8 +1095,11 @@ func buildHTTPListener(port, httpsPort uint32) *listenerv3.Listener {
 // referenced here only by cluster name + secret name. listenerName names the
 // generated listener (the default entrypoint uses the legacy "https_listener";
 // extra entrypoints use "https_listener__<entrypoint>").
-func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certSecretName, acmeSDSClusterName string, plan *securityPlan) *listenerv3.Listener {
-	filters := make([]*hcmv3.HttpFilter, 0, 3+len(plan.listenerFilters))
+func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certSecretName, acmeSDSClusterName string, plan *securityPlan, ssoProfiles []sso.Profile) *listenerv3.Listener {
+	// SSO (oauth2 per profile, then jwt_authn) runs first: an unauthenticated
+	// request is redirected to the IdP before any other filter acts on it.
+	// Listeners with no opted-in router get no SSO filters at all.
+	filters := ssoHTTPFilters(ssoProfiles)
 	var extAuthzFilter, basicAuthRemoveFilter *hcmv3.HttpFilter
 	for _, filter := range plan.listenerFilters {
 		switch filter.Name {

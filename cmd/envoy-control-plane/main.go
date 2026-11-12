@@ -22,6 +22,7 @@ import (
 	"github.com/bryanpfremm/envoy-control-plane/internal/dockerwatch"
 	"github.com/bryanpfremm/envoy-control-plane/internal/infoserver"
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
+	"github.com/bryanpfremm/envoy-control-plane/internal/sso"
 	"github.com/bryanpfremm/envoy-control-plane/internal/staticconfig"
 	"github.com/bryanpfremm/envoy-control-plane/internal/xds"
 )
@@ -55,6 +56,12 @@ func run(logger *slog.Logger) error {
 
 	adsServer := xds.NewServer(logger)
 
+	// SSO profiles are re-read on every snapshot build (each docker event
+	// and every RESYNC_INTERVAL), so edits apply without a restart. A file
+	// that fails to load never stops the control plane: it only rejects the
+	// sso-labeled routers.
+	ssoLoader := sso.NewLoader(cfg.SSOConfigPath, logger)
+
 	snapCfg := xds.Config{
 		BaseDomain:             cfg.BaseDomain,
 		HTTPPort:               cfg.HTTPPort,
@@ -85,7 +92,9 @@ func run(logger *slog.Logger) error {
 		merged := xds.Merge(dockerConfig.HTTP.Routes, staticRoutes, logger)
 		httpConfig := model.HTTPConfiguration{Routes: merged, Services: dockerConfig.HTTP.Services, Middlewares: dockerConfig.HTTP.Middlewares}
 		v := version.Add(1)
-		snap, err := xds.BuildSnapshotForConfigWithTCP(strconv.FormatUint(v, 10), httpConfig, dockerConfig.TCP, snapCfg)
+		buildCfg := snapCfg
+		buildCfg.SSO = ssoLoader.Current()
+		snap, err := xds.BuildSnapshotForConfigWithTCP(strconv.FormatUint(v, 10), httpConfig, dockerConfig.TCP, buildCfg)
 		if err != nil {
 			return fmt.Errorf("building snapshot: %w", err)
 		}

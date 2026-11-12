@@ -17,6 +17,9 @@ services:
       CERT_SECRET_NAME: wildcard-cert
       ACME_SDS_CLUSTER_NAME: acme_sds_cluster
       STATIC_CONFIG_PATH: /etc/envoy-control-plane/static-routes.yaml
+      # Optional OAuth SSO profiles selected by envoy.http.routers.<r>.sso
+      # (see docs/LABELS.md "SSO"). Unset disables SSO.
+      # SSO_CONFIG_PATH: /etc/envoy-control-plane/sso.yaml
       # Optional TCP routing/TLS passthrough: "name=port,name2=port2".
       # Container labels may only select among these names (see docs/LABELS.md);
       # they can never bind a new host port of their own.

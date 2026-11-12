@@ -39,6 +39,11 @@ type Config struct {
 	// to merge into the routing table.
 	StaticConfigPath string
 
+	// SSOConfigPath, if set, points at the operator's SSO profiles YAML
+	// file (see docs/LABELS.md "SSO"). Unset disables SSO: routers with an
+	// .sso label are rejected. The file is re-read on every snapshot build.
+	SSOConfigPath string
+
 	// DockerHost, if set, overrides the Docker client's default connection
 	// target (e.g. a non-default socket path).
 	DockerHost string
@@ -123,6 +128,7 @@ func Load() (Config, error) {
 
 	cfg.StaticConfigPath = os.Getenv("STATIC_CONFIG_PATH")
 	cfg.DockerHost = os.Getenv("DOCKER_HOST")
+	cfg.SSOConfigPath = os.Getenv("SSO_CONFIG_PATH")
 
 	if v := os.Getenv("RESYNC_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)

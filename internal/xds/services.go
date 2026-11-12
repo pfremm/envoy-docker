@@ -122,6 +122,7 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 	// conjure a new bound socket — and an invalid selection must not wedge
 	// the whole snapshot.
 	httpCfg.Routes = dedupeRouteNames(httpCfg.Routes, cfg.Logger)
+	httpCfg.Routes = filterSSORoutes(httpCfg.Routes, cfg, cfg.Logger)
 	byEntrypoint, entrypointNames := groupRoutesByEntrypoint(httpCfg.Routes, cfg, cfg.Logger)
 	// One RDS route configuration per entrypoint. The default entrypoint keeps
 	// the legacy resource name (https_routes); extra entrypoints get a
@@ -301,7 +302,21 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 			rc.VirtualHosts = append(rc.VirtualHosts, errorVHosts...)
 		}
 	}
+	// SSO runs after the error-service virtual hosts exist (so they get the
+	// disabled overrides too) and before the security defaults (so the
+	// synthesized callback routes get the ext_authz disabled override).
+	ssoP := planSSO(routeConfigs, published, cfg, cfg.Logger)
+	for _, c := range ssoP.clusters {
+		if prior, exists := clusterNames[c.Name]; exists {
+			return nil, fmt.Errorf("xDS cluster name %q collides between %s and an SSO profile IdP cluster", c.Name, prior)
+		}
+		clusterNames[c.Name] = "SSO profile IdP cluster"
+		clusterResources = append(clusterResources, c)
+	}
 	applySecurityDefaultsToAll(routeConfigs, plan)
+	for _, rc := range routeConfigs {
+		applyHSTS(rc)
+	}
 
 	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg, cfg.Logger)
 	if err != nil {
@@ -323,7 +338,7 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 	// its own RDS route config.
 	listeners := []cachetypes.Resource{
 		buildHTTPListener(cfg.HTTPPort, cfg.HTTPSPort),
-		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan),
+		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName]),
 	}
 	for _, ep := range entrypointNames {
 		if ep == defaultEntrypointName {
@@ -335,7 +350,7 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 		}
 		listeners = append(listeners, buildHTTPSListener(
 			httpsListenerName+"__"+ep, port, httpsRouteConfigName+"__"+ep,
-			cfg.CertSecretName, cfg.ACMESDSClusterName, plan))
+			cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName+"__"+ep]))
 	}
 	listeners = append(listeners, tcpListeners...)
 
