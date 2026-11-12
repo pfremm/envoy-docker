@@ -100,6 +100,20 @@ type Route struct {
 	// SSO profile (SSO_CONFIG_PATH) that puts this router's whole virtual
 	// host behind Envoy's oauth2 + jwt_authn filters. Empty means public.
 	SSOProfile string
+
+	// UpstreamTLS, when non-nil, makes Envoy connect to this route's
+	// endpoints over TLS (static config `protocol: https`). Nil means plain
+	// HTTP/1, which is every docker-derived route.
+	UpstreamTLS *UpstreamTLS
+}
+
+// UpstreamTLS is the upstream TLS policy of a route whose backend speaks
+// HTTPS. The zero value verifies the backend certificate chain against the
+// system CA bundle.
+type UpstreamTLS struct {
+	// InsecureSkipVerify accepts any backend certificate (e.g. a
+	// self-signed appliance UI). Defaults to false: verification on.
+	InsecureSkipVerify bool
 }
 
 // TracingConfig is the per-route tracing configuration parsed from the

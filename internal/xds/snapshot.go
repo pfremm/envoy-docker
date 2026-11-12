@@ -193,7 +193,7 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 			return nil, fmt.Errorf("xDS cluster name %q collides between %s and application route %q", route.ClusterName(), owner, name)
 		}
 		clusterOwners[route.ClusterName()] = fmt.Sprintf("application route %q", name)
-		clusters = append(clusters, buildCluster(route.ClusterName()))
+		clusters = append(clusters, buildRouteCluster(route, cfg.BaseDomain))
 		endpoints = append(endpoints, buildClusterLoadAssignment(route))
 	}
 	for _, c := range plan.authClusters {
@@ -489,6 +489,39 @@ func buildCluster(name string) *clusterv3.Cluster {
 		},
 		LbPolicy: clusterv3.Cluster_ROUND_ROBIN,
 	}
+}
+
+// systemCABundle is the trusted CA file used to verify HTTPS upstreams.
+const systemCABundle = "/etc/ssl/certs/ca-certificates.crt"
+
+// buildRouteCluster builds the cluster for a route's own endpoints. A route
+// with UpstreamTLS (static `protocol: https`) gets an upstream TLS transport
+// socket; any other route gets the plain buildCluster cluster. Circuit
+// breaker variants clone this cluster, so they inherit the transport socket.
+func buildRouteCluster(route model.Route, baseDomain string) *clusterv3.Cluster {
+	c := buildCluster(route.ClusterName())
+	if route.UpstreamTLS != nil {
+		c.TransportSocket = routeUpstreamTLS(subdomainHost(route, baseDomain), *route.UpstreamTLS)
+	}
+	return c
+}
+
+// routeUpstreamTLS is the envoy.transport_sockets.tls socket for an HTTPS
+// static route. SNI is the route's public host. By default the backend
+// chain is verified against the system CA bundle (a self-signed backend
+// fails the handshake). Envoy has no insecure_skip_verify field:
+// InsecureSkipVerify is expressed as a validation context with no trusted_ca
+// and trust_chain_verification ACCEPT_UNTRUSTED, which accepts any chain.
+func routeUpstreamTLS(sni string, policy model.UpstreamTLS) *corev3.TransportSocket {
+	validation := &tlsv3.CertificateValidationContext{TrustedCa: &corev3.DataSource{Specifier: &corev3.DataSource_Filename{Filename: systemCABundle}}}
+	if policy.InsecureSkipVerify {
+		validation = &tlsv3.CertificateValidationContext{TrustChainVerification: tlsv3.CertificateValidationContext_ACCEPT_UNTRUSTED}
+	}
+	upstreamTLS := &tlsv3.UpstreamTlsContext{
+		Sni:              sni,
+		CommonTlsContext: &tlsv3.CommonTlsContext{ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{ValidationContext: validation}},
+	}
+	return &corev3.TransportSocket{Name: transportSocketTLS, ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: mustAny(upstreamTLS)}}
 }
 
 func buildClusterLoadAssignment(route model.Route) *endpointv3.ClusterLoadAssignment {

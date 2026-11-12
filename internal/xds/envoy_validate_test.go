@@ -125,6 +125,56 @@ func TestEnvoyValidatesSSOSnapshot(t *testing.T) {
 		t.Fatalf("BuildSnapshotForConfig: %v", err)
 	}
 
+	runEnvoyValidate(t, envoyBin, dir, snap)
+}
+
+// TestEnvoyValidatesHTTPSStaticRoutes renders static routes with an HTTPS
+// upstream (one verifying the backend against the system CA bundle, one with
+// tls.insecure_skip_verify) next to a plain HTTP static route into a static
+// bootstrap and runs `envoy --mode validate` on it. Same environment as
+// TestEnvoyValidatesSSOSnapshot: ENVOY_BIN (required), ENVOY_VALIDATE_DIR,
+// ENVOY_VALIDATE_HTTPS_PORT/ENVOY_VALIDATE_HTTP_PORT and
+// ENVOY_VALIDATE_UPSTREAM_PORT (the routes point at 127.0.0.1:<port>).
+func TestEnvoyValidatesHTTPSStaticRoutes(t *testing.T) {
+	envoyBin := os.Getenv("ENVOY_BIN")
+	if envoyBin == "" {
+		t.Skip("ENVOY_BIN not set")
+	}
+	dir := os.Getenv("ENVOY_VALIDATE_DIR")
+	if dir == "" {
+		dir = t.TempDir()
+	} else if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	httpsPort := envPort(t, "ENVOY_VALIDATE_HTTPS_PORT", 18443)
+	httpPort := envPort(t, "ENVOY_VALIDATE_HTTP_PORT", 18080)
+	upstreamPort := envPort(t, "ENVOY_VALIDATE_UPSTREAM_PORT", 1)
+
+	route := func(name string, tls *model.UpstreamTLS) model.Route {
+		return model.Route{
+			Subdomain: name, Source: model.SourceStatic, Origin: "static.yaml", UpstreamTLS: tls,
+			Endpoints: []model.Endpoint{{Address: "127.0.0.1", Port: upstreamPort}},
+		}
+	}
+	snap, err := xds.BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{
+		"plain":    route("plain", nil),
+		"secure":   route("secure", &model.UpstreamTLS{}),
+		"insecure": route("insecure", &model.UpstreamTLS{InsecureSkipVerify: true}),
+	}}, xds.Config{
+		BaseDomain: "example.com", HTTPPort: httpPort, HTTPSPort: httpsPort,
+		CertSecretName: "cert", ACMESDSClusterName: "acme",
+	})
+	if err != nil {
+		t.Fatalf("BuildSnapshotForConfig: %v", err)
+	}
+	runEnvoyValidate(t, envoyBin, dir, snap)
+}
+
+// runEnvoyValidate writes snap as a static bootstrap (bootstrap.json in dir,
+// listener certificate from dir/tls.crt+tls.key, generated if absent) and
+// runs `envoy --mode validate` on it.
+func runEnvoyValidate(t *testing.T, envoyBin, dir string, snap cachev3.ResourceSnapshot) {
+	t.Helper()
 	certPath, keyPath := filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key")
 	if _, err := os.Stat(certPath); err != nil {
 		writeSelfSignedCert(t, certPath, keyPath)

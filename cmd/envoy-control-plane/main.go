@@ -42,9 +42,12 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	staticRoutes, err := staticconfig.Load(cfg.StaticConfigPath)
+	staticRoutes, rejected, err := staticconfig.Load(cfg.StaticConfigPath)
 	if err != nil {
 		return fmt.Errorf("loading static config: %w", err)
+	}
+	for _, r := range rejected {
+		logger.Error("rejecting static router", "origin", r.Origin, "subdomain", r.Subdomain, "reason", r.Reason)
 	}
 	logger.Info("loaded static routes", "count", len(staticRoutes))
 

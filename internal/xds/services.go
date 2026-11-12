@@ -166,7 +166,7 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 			return nil, fmt.Errorf("xDS cluster name %q collides between %s and legacy route %q", clusterName, prior, route.RouterName)
 		}
 		clusterNames[clusterName] = fmt.Sprintf("legacy route %q", route.RouterName)
-		clusterResources = append(clusterResources, buildCluster(clusterName))
+		clusterResources = append(clusterResources, buildRouteCluster(route, cfg.BaseDomain))
 		endpointResources = append(endpointResources, buildClusterLoadAssignment(route))
 	}
 	serviceNames := make([]string, 0, len(httpCfg.Services))
@@ -402,7 +402,7 @@ func buildServiceCluster(s model.HTTPService) *clusterv3.Cluster {
 	case model.ProtocolHTTP2, model.ProtocolGRPC:
 		c.Http2ProtocolOptions = &corev3.Http2ProtocolOptions{}
 	case model.ProtocolHTTPS:
-		validation := &tlsv3.CertificateValidationContext{TrustedCa: &corev3.DataSource{Specifier: &corev3.DataSource_Filename{Filename: "/etc/ssl/certs/ca-certificates.crt"}}}
+		validation := &tlsv3.CertificateValidationContext{TrustedCa: &corev3.DataSource{Specifier: &corev3.DataSource_Filename{Filename: systemCABundle}}}
 		upstreamTLS := &tlsv3.UpstreamTlsContext{CommonTlsContext: &tlsv3.CommonTlsContext{ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{ValidationContext: validation}}}
 		c.TransportSocket = &corev3.TransportSocket{Name: transportSocketTLS, ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: mustAny(upstreamTLS)}}
 		c.UpstreamHttpProtocolOptions = &corev3.UpstreamHttpProtocolOptions{AutoSni: true, AutoSanValidation: true}
