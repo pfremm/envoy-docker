@@ -488,20 +488,128 @@ is exactly the legacy shape (one virtual host per subdomain, no catch-all).
 ## Static YAML config
 
 For non-Docker backends, routes can be declared in a YAML file (path from
-the `STATIC_CONFIG` environment variable; empty means none). On a
-subdomain collision, a static route wins over a Docker-discovered one.
+the `STATIC_CONFIG_PATH` environment variable; empty means none). The file
+is read once at startup. On a subdomain collision, a static route wins over a
+Docker-discovered one.
 
 ```yaml
 routers:
   - subdomain: external
-    port: 443
+    port: 8080
     addresses:
       - 203.0.113.10
       - 203.0.113.11
 ```
 
-Each entry requires a `subdomain`, a `port`, and at least one `addresses`
-entry. Duplicate subdomains within the file are an error.
+Without `protocol`, Envoy talks plain HTTP to the backend. That is true even
+on port `443`: a backend that serves HTTPS needs `protocol: https` (see
+[HTTPS upstreams](#https-upstreams)).
+
+### Static router fields
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `subdomain` | yes | The subdomain this router serves (`<subdomain>.<BASE_DOMAIN>`). Must be unique within the file. |
+| `port` | yes | Backend port, used for every address. |
+| `addresses` | yes | List of backend addresses (at least one). Requests are load-balanced round-robin across them. |
+| `protocol` | no | `http` (default) or `https`, case-insensitive. `https` makes Envoy connect to the backend over TLS. |
+| `tls.insecure_skip_verify` | no | `true`\|`false`, default `false`. Only valid with `protocol: https`. `true` accepts any backend certificate. |
+
+`tls` is a mapping. `insecure_skip_verify` is its only key for now.
+
+### HTTPS upstreams
+
+With `protocol: https`, the router's cluster opens TLS to the backend:
+
+- **SNI** is the route's public host, `<subdomain>.<BASE_DOMAIN>` (for
+  example `nas.example.com`). The backend's own address is not used as SNI.
+- **Verification (default).** The backend's certificate chain is verified
+  against the system CA bundle, `/etc/ssl/certs/ca-certificates.crt`. Only the
+  chain is checked: Envoy does **not** check that the certificate's hostname
+  or SAN matches the SNI or the backend address. Any certificate issued by a
+  trusted CA is accepted.
+- **`insecure_skip_verify: true`** accepts any certificate, including
+  self-signed and expired ones. Envoy has no field by that name: the router
+  gets a validation context with no trusted CA and
+  `trust_chain_verification: ACCEPT_UNTRUSTED`.
+- A backend CA cannot be configured yet. There is no field for a custom CA
+  file, so a privately signed backend has two options: get its CA into the
+  system bundle of the Envoy image, or use `insecure_skip_verify: true`.
+
+`tls: {}` and `tls: {insecure_skip_verify: false}` are the same as omitting
+`tls`: verification stays on.
+
+When verification fails (for example, a self-signed backend without
+`insecure_skip_verify`), the TLS handshake fails. Envoy then answers the client
+with `503` and a body like
+`upstream connect error or disconnect/reset before headers. ... TLS_error ...`.
+The router is still configured; it just cannot reach its backend.
+
+### Static config validation
+
+Errors are either per-router or fatal for the whole file:
+
+- **Rejects only that router:** an unsupported `protocol` (anything but
+  `http`/`https`) or a non-string one, a `tls` block on a router whose
+  protocol is `http` (explicit or default), a `tls` value that is not a
+  mapping, an unknown key inside `tls`, and an `insecure_skip_verify` that is
+  not a boolean. The router is left out and logged at error level
+  (`rejecting static router`, with its `origin` as `<path>[<index>]`, its
+  `subdomain` and the reason). The other routers in the file still load.
+- **Fatal for the whole file** (the control plane does not start): an
+  unreadable file, a YAML syntax error, a router that is not a mapping, a
+  missing `subdomain`, a missing `port` or one of the wrong type, missing or
+  empty `addresses`, and duplicate subdomains. A rejected router still claims
+  its subdomain, so a duplicate of a rejected router is also fatal.
+
+### Static HTTPS examples
+
+A self-signed HTTPS backend, such as the TrueNAS web UI:
+
+```yaml
+routers:
+  - subdomain: nas
+    port: 443
+    addresses:
+      - 192.168.1.10
+    protocol: https
+    tls:
+      insecure_skip_verify: true
+```
+
+Without the `tls` block, this router returns `503` (upstream connect error),
+because TrueNAS's self-signed certificate does not chain to the system CA
+bundle.
+
+A backend with a publicly trusted certificate (for example, from Let's
+Encrypt) keeps verification on:
+
+```yaml
+routers:
+  - subdomain: status
+    port: 443
+    addresses:
+      - 203.0.113.20
+    protocol: https
+```
+
+### Security note: `insecure_skip_verify`
+
+Verification is on by default for every `protocol: https` router. Skipping
+it is opt-in per router and only affects that router.
+
+With `insecure_skip_verify: true`, anything that can intercept traffic between
+Envoy and the backend can present its own certificate and read or change the
+traffic: there is no protection against a man-in-the-middle on that hop. Use it
+only when that network path is trusted, such as a LAN or a host-local backend.
+Custom backend CAs are not supported yet. Until they are, the only way to
+verify a privately signed backend is to add its CA to the Envoy image's
+system bundle.
+
+Even with verification on, the hostname is not checked (see above). Any
+certificate from a publicly trusted CA is accepted, so verification protects
+against untrusted certificates, not against a different holder of a trusted
+one.
 
 ## HTTP entrypoints
 
