@@ -246,16 +246,40 @@ defaults when present.
 buffer filter does not expose `maxresponsebytes`, `memrequestbytes`,
 `memresponsebytes`, or retry-expression at the per-route level. Unsupported
 settings are rejected at model validation rather than silently ignored. When
-any router uses buffering, Envoy's buffer filter is added to the HTTPS filter
-chain in a disabled state, just before the router. Each buffered route enables
-it with its own limit, so other routes, including WebSocket ones, are not
-affected. A buffered route holds the request body until it is complete and
-answers `413 Payload Too Large` once the body exceeds `maxrequestbytes`. This
-is Envoy's buffer limit, not a `Content-Length` check: over HTTP/2, a small
-body that arrives complete in a single DATA frame (up to 16 KiB) is passed
-without being buffered, so it is not checked. Larger or streamed bodies, and
-every HTTP/1.1 body, are checked. Buffered routes also have WebSocket
-upgrades turned off (see "WebSockets and middleware" below).
+any router uses buffering, two filters are added to the HTTPS filter chain in
+a disabled state, just before the router: Envoy's buffer filter and a small
+Lua size guard (`envoy.filters.http.lua.buffer_limit`) right after it. Each
+buffered route enables both with its own limit, so other routes, including
+WebSocket ones, are not affected. A buffered route holds the request body
+until it is complete and answers `413 Payload Too Large` (`text/plain` body
+`Payload Too Large`) when the body is larger than `maxrequestbytes`:
+
+- A body that arrives in several pieces (every HTTP/1.1 body, and HTTP/2
+  bodies sent in more than one DATA frame) is rejected by the buffer filter
+  as soon as more than `maxrequestbytes` have arrived, so Envoy never holds
+  much more than the limit (the limit plus the chunk that crossed it).
+- An HTTP/2 body that arrives complete in a single DATA frame with
+  END_STREAM (up to 16 KiB) passes through Envoy's buffer filter without
+  being checked. The Lua guard catches it: it rejects a `Content-Length`
+  above the limit and then checks the actual body size, so this works with
+  or without a `Content-Length` header. Verified against Envoy 1.37 with a
+  raw HTTP/2 client sending one 2048-byte DATA frame without
+  `Content-Length` to a 1024-byte route: `413`.
+
+No body larger than the limit reaches the upstream; no gap is known to
+remain. One limitation: a declared `Content-Length` above the limit is not
+rejected before the body is read. The buffer filter holds the headers until
+the body is complete, so the guard (which must run after it, see below)
+only sees the request once the limit is exceeded or the body is complete.
+The upstream is never contacted, and Envoy stops reading once the limit is
+crossed (live: a 20000-byte HTTP/2 POST to a 1024-byte route was rejected
+after its first 16 KiB frame). The guard runs after the buffer filter because
+the buffer filter is what raises the per-request buffer limit to
+`maxrequestbytes`. Running first, the guard would have to read the body
+under Envoy's default 1 MiB limit, and routes allowing more than 1 MiB would
+reject larger bodies. Requests without a body (`GET`) are not held.
+Buffered routes also have WebSocket upgrades turned off (see "WebSockets and
+middleware" below).
 
 Regexes are validated when labels are parsed. Invalid expressions never reach
 xDS. Replacements accept Go/Traefik capture references (`$1` or `${1}`), which
@@ -811,8 +835,8 @@ end of the request body, which never comes on an upgrade, so the handshake
 would hang. Routers with a buffering middleware therefore have WebSocket
 upgrades turned off automatically, as if `websocket: "false"` were set. A
 handshake on such a router gets a quick `403`, and `websocket: "true"` does
-not turn upgrades back on. The buffer filter is only active on buffered
-routes, so WebSockets on every other router of the listener work as usual.
+not turn upgrades back on. The buffer filter and its Lua size guard are
+only active on buffered routes, so WebSockets on every other router of the listener work as usual.
 
 ## Observability hooks
 

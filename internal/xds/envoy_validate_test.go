@@ -37,8 +37,8 @@ import (
 
 // TestEnvoyValidatesSSOSnapshot renders a snapshot with two SSO profiles on
 // one listener, an opted-in router per profile, a public router, a buffered
-// router (listener buffer filter disabled, enabled per route via
-// FilterConfig) and the synthesized callback virtual host into a static bootstrap (RDS inlined,
+// router (listener buffer filter and Lua size guard disabled, enabled per
+// route via FilterConfig and LuaPerRoute) and the synthesized callback virtual host into a static bootstrap (RDS inlined,
 // EDS made static, the ACME SDS certificate and the SSO secrets read from
 // local files) and runs `envoy --mode validate` on it.
 //

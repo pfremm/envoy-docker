@@ -1169,8 +1169,20 @@ func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certS
 	// still passes back through CORS, custom_response and the compressors on
 	// the encode path. It acts on request bodies only, so its order relative
 	// to the response-side compressor does not matter.
+	//
+	// The Lua size guard (bufferLimitHTTPFilter) comes right after the buffer
+	// filter, not before it. First in line, its handle:body() would buffer
+	// under the stream's default limit (the 1 MiB connection buffer), because
+	// the buffer filter raises that to the route's limit only once it sees the
+	// headers: live, a 1.5 MB HTTP/1.1 POST to a route allowing 2 MiB got
+	// 413. After the buffer filter, the guard only ever runs on
+	// a body the buffer filter already holds complete under the route's limit;
+	// it decides the case the buffer filter passes unchecked (an HTTP/2 body
+	// in a single DATA frame with END_STREAM). The cost: a Content-Length
+	// above the limit is rejected once the limit is exceeded, not before the
+	// body is read.
 	if plan.needBuffer {
-		filters = append(filters, bufferHTTPFilter())
+		filters = append(filters, bufferHTTPFilter(), bufferLimitHTTPFilter())
 	}
 	filters = append(filters, routerHTTPFilter())
 

@@ -22,7 +22,10 @@ const (
 	corsFilterName       = "envoy.filters.http.cors"
 	compressorFilterName = "envoy.filters.http.compressor"
 	bufferFilterName     = "envoy.filters.http.buffer"
-	grpcWebFilterName    = "envoy.filters.http.grpc_web"
+	// bufferLimitFilterName is the Lua guard enforcing maxrequestbytes on
+	// bodies the buffer filter lets through unchecked (bufferLimitHTTPFilter).
+	bufferLimitFilterName = "envoy.filters.http.lua.buffer_limit"
+	grpcWebFilterName     = "envoy.filters.http.grpc_web"
 )
 
 func applyRouteMiddlewares(er *routev3.Route, chain []model.Middleware) error {
@@ -43,6 +46,7 @@ func applyRouteMiddlewares(er *routev3.Route, chain []model.Middleware) error {
 		delete(er.TypedPerFilterConfig, corsFilterName)
 		delete(er.TypedPerFilterConfig, compressorFilterName)
 		delete(er.TypedPerFilterConfig, bufferFilterName)
+		delete(er.TypedPerFilterConfig, bufferLimitFilterName)
 		delete(er.TypedPerFilterConfig, grpcWebFilterName)
 	}
 	var mutationOps []model.Middleware
@@ -91,6 +95,7 @@ func applyRouteMiddlewares(er *routev3.Route, chain []model.Middleware) error {
 				er.TypedPerFilterConfig = map[string]*anypb.Any{}
 			}
 			er.TypedPerFilterConfig[bufferFilterName] = bufferRouteFilterConfig(m.Buffering)
+			er.TypedPerFilterConfig[bufferLimitFilterName] = bufferLimitRouteFilterConfig(m.Buffering)
 		case m.Compress != nil:
 			// Compression is listener-level in Envoy v1.37; per-route config is too limited.
 			// Handled in planSecurity/listener assembly instead.
