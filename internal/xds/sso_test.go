@@ -9,6 +9,7 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	headermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
 	oauth2v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/oauth2/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
@@ -135,12 +136,24 @@ func TestSSOSnapshot_OptedAndPublicRouters(t *testing.T) {
 	hcm := httpsHCM(t, snap)
 	names := filterNames(hcm)
 	t.Logf("https_listener http_filters: %v", names)
-	if len(names) < 3 || names[0] != oauth2FilterName("nas") || names[1] != jwtAuthnFilterName || names[len(names)-1] != "envoy.filters.http.router" {
-		t.Fatalf("filter order = %v, want oauth2.nas, jwt_authn first and router last", names)
+	if len(names) < 4 || names[0] != ssoHSTSFilterName || names[1] != oauth2FilterName("nas") || names[2] != jwtAuthnFilterName || names[len(names)-1] != "envoy.filters.http.router" {
+		t.Fatalf("filter order = %v, want sso_hsts, oauth2.nas, jwt_authn first and router last", names)
+	}
+
+	// The oauth2 filter's own redirects bypass the route config's
+	// response_headers_to_add; the leading header_mutation filter adds HSTS.
+	var hsts headermutationv3.HeaderMutation
+	unmarshalAny(t, hcm.HttpFilters[0].GetTypedConfig(), &hsts)
+	if err := hsts.ValidateAll(); err != nil {
+		t.Fatalf("header_mutation config fails proto validation: %v", err)
+	}
+	if rm := hsts.GetMutations().GetResponseMutations(); len(rm) != 1 || rm[0].GetAppend().GetHeader().GetKey() != "Strict-Transport-Security" ||
+		rm[0].GetAppend().GetAppendAction().String() != "ADD_IF_ABSENT" {
+		t.Errorf("unexpected sso_hsts config: %v", &hsts)
 	}
 
 	var oauth oauth2v3.OAuth2
-	unmarshalAny(t, hcm.HttpFilters[0].GetTypedConfig(), &oauth)
+	unmarshalAny(t, hcm.HttpFilters[1].GetTypedConfig(), &oauth)
 	if err := oauth.ValidateAll(); err != nil {
 		t.Fatalf("oauth2 config fails proto validation: %v", err)
 	}
@@ -153,7 +166,7 @@ func TestSSOSnapshot_OptedAndPublicRouters(t *testing.T) {
 		t.Errorf("unexpected oauth2 config: %v", oc)
 	}
 	var jwt jwtauthnv3.JwtAuthentication
-	unmarshalAny(t, hcm.HttpFilters[1].GetTypedConfig(), &jwt)
+	unmarshalAny(t, hcm.HttpFilters[2].GetTypedConfig(), &jwt)
 	if err := jwt.ValidateAll(); err != nil {
 		t.Fatalf("jwt_authn config fails proto validation: %v", err)
 	}
@@ -210,6 +223,11 @@ func TestSSOSnapshot_OptedAndPublicRouters(t *testing.T) {
 	if utls.Sni != "auth.example.com" || c.GetType() != clusterv3.Cluster_STRICT_DNS {
 		t.Errorf("sso_idp cluster: sni=%q type=%v", utls.Sni, c.GetType())
 	}
+	// SNI/SAN are pinned in the TLS context; the deprecated
+	// upstream_http_protocol_options would only be a no-op here.
+	if c.UpstreamHttpProtocolOptions != nil {
+		t.Errorf("sso_idp cluster sets deprecated upstream_http_protocol_options: %v", c.UpstreamHttpProtocolOptions)
+	}
 	if port := c.LoadAssignment.Endpoints[0].LbEndpoints[0].GetEndpoint().Address.GetSocketAddress().GetPortValue(); port != 443 {
 		t.Errorf("sso_idp port = %d, want 443", port)
 	}
@@ -238,7 +256,7 @@ func TestSSOSnapshot_NoOptedRoutersLeavesListenerUnchanged(t *testing.T) {
 		t.Fatalf("filters differ with unused SSO config: %v vs %v", a, b)
 	}
 	for _, n := range filterNames(httpsHCM(t, with)) {
-		if strings.HasPrefix(n, oauth2FilterPrefix) || n == jwtAuthnFilterName {
+		if strings.HasPrefix(n, oauth2FilterPrefix) || n == jwtAuthnFilterName || n == ssoHSTSFilterName {
 			t.Fatalf("unexpected SSO filter %q", n)
 		}
 	}
@@ -294,8 +312,8 @@ func TestSSOSnapshot_MultipleProfilesOnOneListener(t *testing.T) {
 		t.Fatal(err)
 	}
 	names := filterNames(httpsHCM(t, snap))
-	want := []string{oauth2FilterName("alpha"), oauth2FilterName("beta"), jwtAuthnFilterName}
-	if !reflect.DeepEqual(names[:3], want) {
+	want := []string{ssoHSTSFilterName, oauth2FilterName("alpha"), oauth2FilterName("beta"), jwtAuthnFilterName}
+	if !reflect.DeepEqual(names[:4], want) {
 		t.Fatalf("filters = %v, want prefix %v", names, want)
 	}
 	routes := routesByName(httpsRouteConfig(t, snap))
@@ -338,7 +356,7 @@ func TestSSOSnapshot_LegacyBuildPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	names := filterNames(httpsHCM(t, snap))
-	if names[0] != oauth2FilterName("nas") || names[1] != jwtAuthnFilterName {
+	if names[0] != ssoHSTSFilterName || names[1] != oauth2FilterName("nas") || names[2] != jwtAuthnFilterName {
 		t.Fatalf("filters = %v", names)
 	}
 	if _, ok := snap.GetResources(resourcev3.ClusterType)["sso_idp"]; !ok {

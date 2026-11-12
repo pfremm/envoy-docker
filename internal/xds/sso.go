@@ -5,8 +5,10 @@ import (
 	"strings"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	mutationrulesv3 "github.com/envoyproxy/go-control-plane/envoy/config/common/mutation_rules/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	headermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
 	oauth2v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/oauth2/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
@@ -26,6 +28,7 @@ import (
 const (
 	oauth2FilterPrefix = "envoy.filters.http.oauth2."
 	jwtAuthnFilterName = "envoy.filters.http.jwt_authn"
+	ssoHSTSFilterName  = "envoy.filters.http.header_mutation.sso_hsts"
 
 	// ssoCallbackVHPrefix names the virtual host synthesized for a
 	// redirect_uri_host no router serves.
@@ -39,11 +42,16 @@ func oauth2FilterName(profile string) string { return oauth2FilterPrefix + profi
 // listener's inline route config never gets it (HSTS over plain HTTP is
 // ignored by browsers and would be misleading).
 func applyHSTS(rc *routev3.RouteConfiguration) {
-	// ADD_IF_ABSENT: an upstream that sets its own policy keeps it.
-	rc.ResponseHeadersToAdd = append(rc.ResponseHeadersToAdd, &corev3.HeaderValueOption{
+	rc.ResponseHeadersToAdd = append(rc.ResponseHeadersToAdd, hstsHeader())
+}
+
+// hstsHeader is the HSTS response header. ADD_IF_ABSENT: an upstream that
+// sets its own policy keeps it.
+func hstsHeader() *corev3.HeaderValueOption {
+	return &corev3.HeaderValueOption{
 		Header:       &corev3.HeaderValue{Key: "Strict-Transport-Security", Value: "max-age=31536000; includeSubDomains"},
 		AppendAction: corev3.HeaderValueOption_ADD_IF_ABSENT,
-	})
+	}
 }
 
 // filterSSORoutes rejects (only) the routers whose .sso label cannot be
@@ -271,14 +279,28 @@ func addSSOCallbackRoutes(rc *routev3.RouteConfiguration, profiles []sso.Profile
 	return callbacks
 }
 
-// ssoHTTPFilters returns the oauth2 filters (one per profile, sorted) and
-// the jwt_authn filter for a listener, or nil when the listener has no
-// opted-in router.
+// ssoHTTPFilters returns the HSTS header_mutation filter, the oauth2
+// filters (one per profile, sorted) and the jwt_authn filter for a listener,
+// or nil when the listener has no opted-in router.
+//
+// The oauth2 filter writes its login/signout redirects and callback errors
+// directly, bypassing the route configuration's response_headers_to_add, so
+// without the leading header_mutation filter (which sees every response
+// encoded by a later filter) the first response from an SSO host would lack
+// HSTS.
 func ssoHTTPFilters(profiles []sso.Profile) []*hcmv3.HttpFilter {
 	if len(profiles) == 0 {
 		return nil
 	}
-	filters := make([]*hcmv3.HttpFilter, 0, len(profiles)+1)
+	filters := make([]*hcmv3.HttpFilter, 0, len(profiles)+2)
+	filters = append(filters, &hcmv3.HttpFilter{
+		Name: ssoHSTSFilterName,
+		ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mustAny(&headermutationv3.HeaderMutation{
+			Mutations: &headermutationv3.Mutations{ResponseMutations: []*mutationrulesv3.HeaderMutation{{
+				Action: &mutationrulesv3.HeaderMutation_Append{Append: hstsHeader()},
+			}}},
+		})},
+	})
 	jwt := &jwtauthnv3.JwtAuthentication{
 		Providers:      map[string]*jwtauthnv3.JwtProvider{},
 		RequirementMap: map[string]*jwtauthnv3.JwtRequirement{},

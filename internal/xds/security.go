@@ -687,7 +687,12 @@ func buildAuthCluster(name string, svc *authService) *clusterv3.Cluster {
 				}}
 			}
 			tlsContext.CommonTlsContext = &tlsv3.CommonTlsContext{ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{ValidationContext: validation}}
-			cluster.UpstreamHttpProtocolOptions = &corev3.UpstreamHttpProtocolOptions{AutoSni: svc.serverName == "", AutoSanValidation: svc.serverName == ""}
+			if svc.serverName == "" {
+				// With an explicit server name SNI and SAN are pinned
+				// above; only derive them from the Host header otherwise
+				// (and avoid the deprecated field when it would be a no-op).
+				cluster.UpstreamHttpProtocolOptions = &corev3.UpstreamHttpProtocolOptions{AutoSni: true, AutoSanValidation: true}
+			}
 		}
 		cluster.TransportSocket = &corev3.TransportSocket{
 			Name:       transportSocketTLS,

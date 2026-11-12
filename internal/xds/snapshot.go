@@ -1096,8 +1096,9 @@ func buildHTTPListener(port, httpsPort uint32) *listenerv3.Listener {
 // generated listener (the default entrypoint uses the legacy "https_listener";
 // extra entrypoints use "https_listener__<entrypoint>").
 func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certSecretName, acmeSDSClusterName string, plan *securityPlan, ssoProfiles []sso.Profile) *listenerv3.Listener {
-	// SSO (oauth2 per profile, then jwt_authn) runs first: an unauthenticated
-	// request is redirected to the IdP before any other filter acts on it.
+	// SSO (HSTS, oauth2 per profile, then jwt_authn) runs first: an
+	// unauthenticated request is redirected to the IdP before any other
+	// filter acts on it.
 	// Listeners with no opted-in router get no SSO filters at all.
 	filters := ssoHTTPFilters(ssoProfiles)
 	var extAuthzFilter, basicAuthRemoveFilter *hcmv3.HttpFilter

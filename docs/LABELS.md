@@ -574,7 +574,10 @@ sso_profiles:
   else is synthesized if no router serves that host). The host must be
   covered by the listener certificate (`CERT_SECRET_NAME`, normally a
   wildcard) and must reach an entrypoint that serves at least one router of
-  the profile.
+  the profile. `signout_path` also works on every host protected by the
+  profile; Envoy then redirects to that host's `/` (on the synthesized
+  callback host that lands on its 404), so link sign-out from the
+  protected hosts.
 - **Secrets** are file-based SDS: the control plane only references
   `sds_path` (an absolute path **inside the Envoy container**) and never reads
   it. `token_secret` holds the client secret for a confidential client;
@@ -598,7 +601,9 @@ sso_profiles:
 All generated HTTPS route configurations also add
 `Strict-Transport-Security: max-age=31536000; includeSubDomains` to responses
 that do not already carry the header (never on the plain-HTTP redirect
-listener).
+listener). Listeners with SSO add it through a leading `header_mutation`
+filter as well, because the oauth2 filter's own redirects and errors bypass
+the route configuration's response headers.
 
 ## Observability hooks
 
