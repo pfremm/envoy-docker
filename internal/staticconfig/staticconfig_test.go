@@ -105,6 +105,9 @@ func writeConfig(t *testing.T, contents string) string {
 func TestLoad_UpstreamProtocol(t *testing.T) {
 	path := writeConfig(t, `
 routers:
+  - subdomain: implicit
+    port: 80
+    addresses: ["10.0.0.9"]
   - subdomain: plain
     port: 80
     addresses: ["10.0.0.1"]
@@ -141,8 +144,14 @@ routers:
 	if len(rejected) != 0 {
 		t.Fatalf("Load() rejected %+v, want none", rejected)
 	}
-	if routes["plain"].UpstreamTLS != nil {
-		t.Errorf("plain: UpstreamTLS = %+v, want nil", routes["plain"].UpstreamTLS)
+	if len(routes) != 7 {
+		t.Fatalf("Load() = %d routes, want 7: %+v", len(routes), routes)
+	}
+	// Omitted and explicit http both mean a plain upstream: no TLS.
+	for _, name := range []string{"implicit", "plain"} {
+		if tls := routes[name].UpstreamTLS; tls != nil {
+			t.Errorf("%s: UpstreamTLS = %+v, want nil", name, tls)
+		}
 	}
 	// https without (or with an empty/false) tls block verifies the backend.
 	for _, name := range []string{"secure", "emptytls", "explicit", "upper"} {
@@ -201,3 +210,92 @@ routers:
 		})
 	}
 }
+
+// TestLoad_RejectionsKeepValidRouters checks mixed files: every bad router
+// is rejected on its own, in file order, while each valid router (including
+// an https one) loads with its upstream TLS policy intact.
+func TestLoad_RejectionsKeepValidRouters(t *testing.T) {
+	tests := []struct {
+		name     string
+		contents string
+		// wantTLS maps each loaded subdomain to its expected UpstreamTLS
+		// (nil for http).
+		wantTLS  map[string]*bool
+		rejected []string
+	}{
+		{
+			name: "two bad routers and one good",
+			contents: `
+routers:
+  - subdomain: bad1
+    port: 80
+    addresses: ["10.0.0.1"]
+    protocol: ftp
+  - subdomain: good
+    port: 80
+    addresses: ["10.0.0.2"]
+  - subdomain: bad2
+    port: 443
+    addresses: ["10.0.0.3"]
+    protocol: https
+    tls: {insecure: true}
+`,
+			wantTLS:  map[string]*bool{"good": nil},
+			rejected: []string{"bad1", "bad2"},
+		},
+		{
+			name: "valid https alongside a bad router",
+			contents: `
+routers:
+  - subdomain: secure
+    port: 443
+    addresses: ["10.0.0.1"]
+    protocol: https
+  - subdomain: bad
+    port: 80
+    addresses: ["10.0.0.2"]
+    tls: {insecure_skip_verify: true}
+  - subdomain: truenas
+    port: 8443
+    addresses: ["10.0.0.3"]
+    protocol: https
+    tls: {insecure_skip_verify: true}
+`,
+			wantTLS:  map[string]*bool{"secure": ptr(false), "truenas": ptr(true)},
+			rejected: []string{"bad"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			routes, rejected, err := Load(writeConfig(t, tt.contents))
+			if err != nil {
+				t.Fatalf("Load() unexpected error: %v", err)
+			}
+			if len(routes) != len(tt.wantTLS) {
+				t.Errorf("routes = %+v, want exactly %v", routes, tt.wantTLS)
+			}
+			for name, want := range tt.wantTLS {
+				route, ok := routes[name]
+				if !ok {
+					t.Errorf("route %q missing", name)
+					continue
+				}
+				switch got := route.UpstreamTLS; {
+				case want == nil && got != nil:
+					t.Errorf("%s: UpstreamTLS = %+v, want nil", name, got)
+				case want != nil && (got == nil || got.InsecureSkipVerify != *want):
+					t.Errorf("%s: UpstreamTLS = %+v, want InsecureSkipVerify=%v", name, got, *want)
+				}
+			}
+			var got []string
+			for _, r := range rejected {
+				got = append(got, r.Subdomain)
+			}
+			if strings.Join(got, ",") != strings.Join(tt.rejected, ",") {
+				t.Errorf("rejected subdomains = %v, want %v", got, tt.rejected)
+			}
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
