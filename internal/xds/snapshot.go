@@ -823,10 +823,13 @@ func buildRoutesForRoute(route model.Route, logger *slog.Logger) []*routev3.Rout
 const websocketUpgradeType = "websocket"
 
 // applyRouteWebSocket disables the websocket upgrade on a route whose router
-// set .websocket=false. Routers that leave it unset (or true) carry no
-// route-level upgrade config and inherit the HCM default (enabled).
+// set .websocket=false or uses a buffering middleware. The buffer filter waits
+// for an end of body that never comes on an upgrade, so a WebSocket handshake
+// on a buffered route would hang; disabling the upgrade turns it into a fast
+// 403. Other routers carry no route-level upgrade config and inherit the HCM
+// default (enabled).
 func applyRouteWebSocket(er *routev3.Route, route model.Route) {
-	if !route.WebSocketDisabled {
+	if !route.WebSocketDisabled && !routeHasBuffering(route) {
 		return
 	}
 	if ra := er.GetRoute(); ra != nil {
@@ -1159,7 +1162,17 @@ func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certS
 	if plan.needCustomResponse {
 		filters = append(filters, customResponseHTTPFilter())
 	}
-	filters = append(filters, corsHTTPFilter(), routerHTTPFilter())
+	filters = append(filters, corsHTTPFilter())
+	// The buffer filter (disabled listener-wide, enabled only on buffered
+	// routes) sits last before the router: auth filters reject unauthenticated
+	// requests before their bodies are buffered, and its 413 local reply
+	// still passes back through CORS, custom_response and the compressors on
+	// the encode path. It acts on request bodies only, so its order relative
+	// to the response-side compressor does not matter.
+	if plan.needBuffer {
+		filters = append(filters, bufferHTTPFilter())
+	}
+	filters = append(filters, routerHTTPFilter())
 
 	hcm := &hcmv3.HttpConnectionManager{
 		StatPrefix: "https",

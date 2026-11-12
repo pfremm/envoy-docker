@@ -36,8 +36,9 @@ import (
 )
 
 // TestEnvoyValidatesSSOSnapshot renders a snapshot with two SSO profiles on
-// one listener, an opted-in router per profile, a public router and the
-// synthesized callback virtual host into a static bootstrap (RDS inlined,
+// one listener, an opted-in router per profile, a public router, a buffered
+// router (listener buffer filter disabled, enabled per route via
+// FilterConfig) and the synthesized callback virtual host into a static bootstrap (RDS inlined,
 // EDS made static, the ACME SDS certificate and the SSO secrets read from
 // local files) and runs `envoy --mode validate` on it.
 //
@@ -95,12 +96,16 @@ func TestEnvoyValidatesSSOSnapshot(t *testing.T) {
 	}
 	wsoff := route("wsoff", "")
 	wsoff.WebSocketDisabled = true
+	bufMW := model.Middleware{Name: "buf", Buffering: &model.BufferingMiddleware{MaxRequestBytes: 1024}}
+	buf := route("buf", "")
+	buf.MiddlewareNames, buf.Middlewares = []string{"buf"}, []model.Middleware{bufMW}
 	snap, err := xds.BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{
 		"app":   route("app", "nas"),
 		"media": route("media", "media"),
 		"www":   route("www", ""),
 		"wsoff": wsoff,
-	}}, xds.Config{
+		"buf":   buf,
+	}, Middlewares: map[string]model.Middleware{"buf": bufMW}}, xds.Config{
 		BaseDomain: "example.com", HTTPPort: httpPort, HTTPSPort: httpsPort,
 		CertSecretName: "cert", ACMESDSClusterName: "acme", SSO: ssoCfg,
 	})

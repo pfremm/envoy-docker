@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
-	bufferv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/buffer/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/bryanpfremm/envoy-control-plane/internal/model"
@@ -126,10 +125,7 @@ func TestApplyRouteMiddlewares_Buffering(t *testing.T) {
 				if !ok {
 					t.Fatal("expected buffer per-route config, got none")
 				}
-				var bpr bufferv3.BufferPerRoute
-				if err := cfg.UnmarshalTo(&bpr); err != nil {
-					t.Fatalf("failed to unmarshal buffer config: %v", err)
-				}
+				bpr := unwrapBufferRouteConfig(t, cfg)
 				if b := bpr.GetBuffer(); b != nil {
 					if b.MaxRequestBytes.GetValue() != tt.wantMaxRequestBytes {
 						t.Errorf("MaxRequestBytes = %d, want %d", b.MaxRequestBytes.GetValue(), tt.wantMaxRequestBytes)
@@ -188,10 +184,7 @@ func TestApplyRouteMiddlewares_RetryAndBufferingComposed(t *testing.T) {
 	if !ok {
 		t.Fatal("expected buffer per-route config")
 	}
-	var bpr bufferv3.BufferPerRoute
-	if err := cfg.UnmarshalTo(&bpr); err != nil {
-		t.Fatalf("failed to unmarshal buffer config: %v", err)
-	}
+	bpr := unwrapBufferRouteConfig(t, cfg)
 	if b := bpr.GetBuffer(); b == nil || b.MaxRequestBytes.GetValue() != 2048 {
 		t.Errorf("buffer config incorrect: got %+v", b)
 	}

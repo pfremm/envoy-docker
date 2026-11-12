@@ -77,6 +77,10 @@ type securityPlan struct {
 	// needGRPCWeb is true when at least one route references a grpcweb
 	// middleware, installing the listener-wide grpc_web filter.
 	needGRPCWeb bool
+	// needBuffer is true when at least one route references a buffering
+	// middleware, installing the listener-wide buffer filter (disabled;
+	// buffered routes enable it per route).
+	needBuffer bool
 	// needCustomResponse is true when at least one route references an
 	// errors middleware, installing the listener-wide custom_response
 	// filter (its actual behavior is entirely per-route override).
@@ -118,6 +122,8 @@ func planSecurity(routes map[string]model.Route) (*securityPlan, error) {
 				}
 			case m.GRPCWeb != nil:
 				p.needGRPCWeb = true
+			case m.Buffering != nil:
+				p.needBuffer = true
 			case m.Errors != nil:
 				p.needCustomResponse = true
 				errorServiceSet[m.Errors.Service] = true

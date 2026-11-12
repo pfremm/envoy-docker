@@ -182,7 +182,7 @@ standard middleware stack. Unsupported orderings reject only that router.
 | `compress` | `minresponsebytes`, `contenttypes` (list), `excludedcontenttypes` (list), `disableonetagheader` |
 | `retry` | `attempts` (required positive integer), `pertrytimeout` (required duration), `retryon` (required Envoy retry conditions) |
 | `circuitbreaker` | `maxconnections`, `maxpendingrequests`, `maxrequests`, `maxretries` (at least one required) |
-| `buffering` | `maxrequestbytes`, `maxresponsebytes` (at least one required); `retryexpression` is not supported |
+| `buffering` | `maxrequestbytes` (required); `maxresponsebytes`, `memrequestbytes`, `memresponsebytes` and `retryexpression` are rejected |
 | `errors` | `status` (required list of codes/ranges like `404,500-599`), `service` (required), `query` (path, optional) |
 | `grpcweb` | `enabled` (must be `true`; omit the middleware if you don't want gRPC-Web) |
 
@@ -245,7 +245,17 @@ defaults when present.
 **Buffering** is per-route and implemented for `maxrequestbytes` only; Envoy's
 buffer filter does not expose `maxresponsebytes`, `memrequestbytes`,
 `memresponsebytes`, or retry-expression at the per-route level. Unsupported
-settings are rejected at model validation rather than silently ignored.
+settings are rejected at model validation rather than silently ignored. When
+any router uses buffering, Envoy's buffer filter is added to the HTTPS filter
+chain in a disabled state, just before the router. Each buffered route enables
+it with its own limit, so other routes, including WebSocket ones, are not
+affected. A buffered route holds the request body until it is complete and
+answers `413 Payload Too Large` once the body exceeds `maxrequestbytes`. This
+is Envoy's buffer limit, not a `Content-Length` check: over HTTP/2, a small
+body that arrives complete in a single DATA frame (up to 16 KiB) is passed
+without being buffered, so it is not checked. Larger or streamed bodies, and
+every HTTP/1.1 body, are checked. Buffered routes also have WebSocket
+upgrades turned off (see "WebSockets and middleware" below).
 
 Regexes are validated when labels are parsed. Invalid expressions never reach
 xDS. Replacements accept Go/Traefik capture references (`$1` or `${1}`), which
@@ -798,8 +808,11 @@ middlewares act on the handshake request only. The `compress` filters leave
 the `101` response and the frames alone (verified). The `buffering`
 middleware does not work with upgrades: Envoy's buffer filter waits for the
 end of the request body, which never comes on an upgrade, so the handshake
-hangs. Set `websocket: "false"` on buffered routers, or do not combine
-buffering with WebSocket routes.
+would hang. Routers with a buffering middleware therefore have WebSocket
+upgrades turned off automatically, as if `websocket: "false"` were set. A
+handshake on such a router gets a quick `403`, and `websocket: "true"` does
+not turn upgrades back on. The buffer filter is only active on buffered
+routes, so WebSockets on every other router of the listener work as usual.
 
 ## Observability hooks
 

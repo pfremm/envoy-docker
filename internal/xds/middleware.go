@@ -90,7 +90,7 @@ func applyRouteMiddlewares(er *routev3.Route, chain []model.Middleware) error {
 			if er.TypedPerFilterConfig == nil {
 				er.TypedPerFilterConfig = map[string]*anypb.Any{}
 			}
-			er.TypedPerFilterConfig[bufferFilterName] = mustAny(bufferPerRoute(m.Buffering))
+			er.TypedPerFilterConfig[bufferFilterName] = bufferRouteFilterConfig(m.Buffering)
 		case m.Compress != nil:
 			// Compression is listener-level in Envoy v1.37; per-route config is too limited.
 			// Handled in planSecurity/listener assembly instead.
