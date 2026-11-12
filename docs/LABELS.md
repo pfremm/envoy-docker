@@ -29,7 +29,7 @@ number of routers.
 | `envoy.http.routers.<name>.priority` | no | An explicit integer priority that overrides rule-specificity ordering. See [Precedence](#precedence). |
 | `envoy.http.routers.<name>.middlewares` | no | Ordered comma/escape list of named HTTP middleware. See [HTTP middleware](#http-middleware). |
 | `envoy.http.routers.<name>.timeout` | no | Total upstream request timeout as a Go duration (`30s`, `500ms`). `0s` disables Envoy's route timeout. |
-| `envoy.http.routers.<name>.idletimeout` | no | Per-route stream idle timeout as a Go duration. `0s` disables it. |
+| `envoy.http.routers.<name>.idletimeout` | no | Per-route stream idle timeout as a Go duration. `0s` disables it. Unset uses Envoy's 5m default; see [Protocol support](#protocol-support-http2-http3-websockets) for long-lived streams. |
 | `envoy.http.routers.<name>.retries.attempts` | no | Positive total attempt count, including the initial request. Envoy receives `attempts-1` retries; `1` means no retry. |
 | `envoy.http.routers.<name>.retries.pertrytimeout` | no | Positive timeout for each try. |
 | `envoy.http.routers.<name>.retries.retryon` | no | Envoy retry conditions, for example `5xx,reset,connect-failure`. |
@@ -604,6 +604,169 @@ that do not already carry the header (never on the plain-HTTP redirect
 listener). Listeners with SSO add it through a leading `header_mutation`
 filter as well, because the oauth2 filter's own redirects and errors bypass
 the route configuration's response headers.
+
+### Profile field reference
+
+The file has exactly one top-level key, `sso_profiles`, mapping profile names
+to profiles. An unknown top-level key or a file that is not valid YAML is a
+file-level error: every sso-labeled router is then rejected. Profile names
+are 1-63 characters of letters, digits, `-` or `_`, starting with a letter or
+digit. Unknown keys inside a profile (including an inline `client_secret`,
+which is deliberately unsupported) invalidate that profile only.
+
+| Field | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `redirect_uri_host` | yes | | Fixed callback host, optionally with `:port` (HTTPS on a non-standard port). A bare host name: no scheme, path, query or userinfo. |
+| `redirect_path` | no | `/oauth2/callback` | Callback path. Absolute (starts with `/`), no `?`, `#` or whitespace. Must differ from `signout_path`. |
+| `signout_path` | no | `/oauth2/signout` | Sign-out path, same constraints as `redirect_path`. |
+| `cookie_domain` | yes | | Session cookie domain. A leading `.` is stripped. `redirect_uri_host` (ignoring its port) must equal it or be a subdomain of it. |
+| `issuer` | yes | | Must equal the `iss` claim of the IdP's tokens exactly. Compared as an opaque string, so a trailing `/` matters. |
+| `authorization_endpoint` | yes | | Absolute `https://` URL with no userinfo. The browser is redirected here. |
+| `token_endpoint` | yes | | `{cluster, uri, timeout}`. Envoy calls this to exchange the authorization code. `cache_duration` is rejected here. |
+| `token_endpoint.cluster` | yes | | Name of the generated IdP cluster: 1-128 characters of letters, digits, `_`, `.` or `-`, starting with a letter or digit. |
+| `token_endpoint.uri` | yes | | Absolute `https://` URL, no userinfo. Port defaults to 443. |
+| `token_endpoint.timeout` | no | `5s` | Positive Go duration. |
+| `jwks` | yes | | `{cluster, uri, timeout, cache_duration}`. Where jwt_authn fetches the signing keys. `cluster`, `uri` and `timeout` follow the same rules as in `token_endpoint`. `token_endpoint` and `jwks` may share a cluster name only if both URIs have the same host:port. |
+| `jwks.cache_duration` | no | `300s` | Positive Go duration: how long the fetched JWKS is cached. |
+| `credentials.client_id` | yes | | OAuth client ID. |
+| `hmac_secret.name` | yes | | SDS secret name. Must match the `name` inside the secret file and differ from `token_secret.name`. |
+| `hmac_secret.sds_path` | yes | | Absolute path of the SDS file **inside the Envoy container**. |
+| `token_secret.name` | yes | | SDS secret name of the client secret (or a dummy value for a public client). |
+| `token_secret.sds_path` | yes | | Absolute path, as for `hmac_secret.sds_path`. |
+| `auth_scopes` | no | `[openid, email]` | Requested scopes. If present it must be non-empty, and no entry may be empty or contain whitespace. |
+| `pass_through_matcher.header` | if block present | `authorization` | Header whose presence (with `prefix`) skips the browser flow. Must be a valid HTTP header name. Matched case-insensitively. |
+| `pass_through_matcher.prefix` | if block present | `Bearer ` | Required, non-empty value prefix. |
+
+Profiles are also checked against each other, in sorted name order. When two
+profiles conflict, the later one is invalidated. A cluster name must point at
+one host:port across all profiles. A secret name must map to one `sds_path`.
+Profiles sharing a `redirect_uri_host` need distinct `redirect_path` and
+`signout_path` values.
+
+### Machine clients (Bearer pass-through)
+
+A request that matches the profile's `pass_through_matcher` (by default any
+`Authorization` header starting with `Bearer `) skips the oauth2 filter's
+browser redirect and goes straight to jwt_authn. jwt_authn then validates the
+token against the profile:
+
+- the signature must verify against the keys from the profile's `jwks`;
+- `iss` must equal `issuer`;
+- `exp`/`nbf` are enforced (Envoy's jwt_authn default).
+
+**`aud` is not checked.** The generated provider configures no
+`audiences`, so any unexpired JWT signed by the IdP's JWKS with a matching
+`iss` is accepted, whichever client it was issued to. If your IdP shares one
+issuer across applications, give each protected app its own issuer (for
+example Authentik's per-application issuer URLs), or check the audience in the
+backend. The validated token is forwarded upstream unchanged.
+
+A missing, malformed, expired or wrongly signed token is answered by jwt_authn
+with **401** (no redirect to the IdP). Tokens must be JWTs from the same
+issuer. Opaque access tokens cannot be validated.
+
+jwt_authn only reads the token from `Authorization: Bearer <jwt>`. If you
+change `pass_through_matcher` to a different header, matching requests still
+skip the browser flow, but they get a 401 unless they also carry an
+`Authorization: Bearer` JWT.
+
+```sh
+# Obtain an access token from the IdP however your client does (e.g. client
+# credentials), then:
+TOKEN=$(curl -s https://auth.example.com/application/o/token/ \
+  -d grant_type=client_credentials -d client_id=my-script -d client_secret=... \
+  | jq -r .access_token)
+curl -H "Authorization: Bearer $TOKEN" https://files.nas2.pfrem.me/api/status
+# no token / bad token -> 401 from Envoy, never a 302 to the IdP
+```
+
+### Callback host pattern
+
+Use one dedicated callback host per profile (or shared by profiles), for
+example `sso.<BASE_DOMAIN>`, rather than one of the protected hosts:
+
+1. Set `redirect_uri_host: sso.<BASE_DOMAIN>` (add `:port` if the HTTPS
+   entrypoint is not on 443).
+2. Register exactly `https://<redirect_uri_host><redirect_path>` (with the
+   defaults, `https://sso.<BASE_DOMAIN>/oauth2/callback`) as the redirect URI
+   at the IdP. Envoy sends this fixed URI for every protected host, so only
+   one redirect URI is needed however many hosts use the profile.
+3. Set `cookie_domain` to a parent domain covering both the callback host and
+   every protected host, typically `<BASE_DOMAIN>`. The session cookies are
+   set while serving the callback host, and browsers must send them to the
+   protected hosts. A `redirect_uri_host` outside `cookie_domain` invalidates
+   the profile. A protected host outside it gets stuck in a login loop.
+4. Make sure the listener certificate (`CERT_SECRET_NAME`) covers the callback
+   host. A `*.<BASE_DOMAIN>` wildcard covers `sso.<BASE_DOMAIN>`.
+5. No container needs to serve the callback host. If no router does, the
+   control plane synthesizes a virtual host (`sso_callback__<host>`) holding
+   only the callback/sign-out routes plus a catch-all 404. It is added to
+   every listener that serves a router of the profile. If a router does serve
+   that host, the two exact-path routes are prepended to its virtual host.
+
+### SDS secret files
+
+`hmac_secret` and `token_secret` point at Envoy file-based SDS files that
+must be mounted into the **Envoy** container (the control plane never reads
+them). Each file holds one `Secret` resource whose `name` matches the
+profile's secret `name`:
+
+```yaml
+# /etc/envoy/secrets/sso-nas-hmac.yaml
+resources:
+  - "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
+    name: sso-nas-hmac
+    generic_secret:
+      secret:
+        inline_string: "REPLACE_WITH_openssl_rand_-base64_32"
+```
+
+```yaml
+# /etc/envoy/secrets/sso-nas-token.yaml
+resources:
+  - "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
+    name: sso-nas-token
+    generic_secret:
+      secret:
+        inline_string: "the-client-secret-from-the-idp"
+```
+
+- The HMAC secret signs the session cookies. Make it random and keep it
+  private, e.g. `openssl rand -base64 32`. Changing it invalidates existing
+  sessions.
+- For a **public** (PKCE-only) client, `token_secret` is still required by
+  Envoy's oauth2 filter. Put any dummy string in its file.
+- The IdP must issue **JWT** access tokens (jwt_authn validates the forwarded
+  access token, not the ID token). Opaque access tokens fail with 401 after
+  login.
+- The files must be readable by the Envoy process. Envoy watches the path;
+  replace the file atomically (write a temp file, then `mv`) when rotating.
+
+## Protocol support (HTTP/2, HTTP/3, WebSockets)
+
+What the generated listeners speak today, from `buildHTTPSListener` and
+`buildHTTPListener` (`internal/xds/snapshot.go`):
+
+| Protocol | Status |
+| --- | --- |
+| Downstream HTTP/1.1 | Supported. This is what clients use. |
+| Downstream HTTP/2 | **Not negotiated.** The HTTPS listeners' TLS context sets no `alpn_protocols`, so Envoy offers no `h2` in ALPN and browsers and ordinary clients fall back to HTTP/1.1. The HTTP connection managers leave `codec_type` unset (`AUTO`), so a client sending the HTTP/2 preface with prior knowledge (`curl --http2-prior-knowledge`) would still be understood. Do not rely on that: standard gRPC clients require `h2` via ALPN, so native gRPC from outside does not work (use the [grpcweb middleware](#http-middleware) over HTTP/1.1 instead). Advertising `h2` is future work. |
+| Upstream HTTP/2 / gRPC | Supported per named service with `envoy.http.services.<svc>.loadbalancer.protocol: http2` or `grpc`, which enables HTTP/2 on that service's cluster. Legacy port-only routers always use HTTP/1.1 upstream. This is independent of the downstream protocol. |
+| HTTP/3 / QUIC | **Not supported.** No UDP/QUIC listeners are generated and no `alt-svc` header is sent, so clients never attempt HTTP/3. |
+| WebSockets | **Not supported yet.** Neither the HTTP connection managers nor the routes set `upgrade_configs`, and Envoy refuses upgrades that are not configured: a request with `Upgrade: websocket` is rejected with 403 instead of being proxied. Enabling `websocket` upgrades is future work. |
+
+**Long-lived streams and `idletimeout`.** The connection managers do not set
+`stream_idle_timeout`, so Envoy's default of **5 minutes** applies: a stream
+with no request or response activity for 5 minutes is closed (408 if no
+response headers were sent yet, otherwise a reset). For routers serving
+long-lived, mostly quiet responses (Server-Sent Events, long polling, large
+slow downloads, and WebSockets once supported), set
+`envoy.http.routers.<r>.idletimeout: "0s"` to disable the route's idle timeout,
+or set a value longer than the longest expected silence. The route `timeout`
+(Envoy default 15s) is a separate limit: it runs from the end of the request
+until the response is complete, so a streaming response that lasts longer is
+cut off unless `envoy.http.routers.<r>.timeout: "0s"` (or a large value) is
+also set.
 
 ## Observability hooks
 

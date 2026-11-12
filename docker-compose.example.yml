@@ -18,8 +18,9 @@ services:
       ACME_SDS_CLUSTER_NAME: acme_sds_cluster
       STATIC_CONFIG_PATH: /etc/envoy-control-plane/static-routes.yaml
       # Optional OAuth SSO profiles selected by envoy.http.routers.<r>.sso
-      # (see docs/LABELS.md "SSO"). Unset disables SSO.
-      # SSO_CONFIG_PATH: /etc/envoy-control-plane/sso.yaml
+      # (see docs/LABELS.md "SSO"). Unset disables SSO. The profiles' secret
+      # files are mounted into the envoy service, not here.
+      SSO_CONFIG_PATH: /etc/envoy-control-plane/sso.yaml
       # Optional TCP routing/TLS passthrough: "name=port,name2=port2".
       # Container labels may only select among these names (see docs/LABELS.md);
       # they can never bind a new host port of their own.
@@ -36,6 +37,7 @@ services:
       # Read-only is enough - the control plane only lists/inspects/watches.
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./config/static-routes.example.yaml:/etc/envoy-control-plane/static-routes.yaml:ro
+      - ./config/sso.example.yaml:/etc/envoy-control-plane/sso.yaml:ro
     ports:
       - "9902:9902" # info page - http://localhost:9902/, drop if you don't want it exposed
     networks:
@@ -72,6 +74,12 @@ services:
         exec envoy -c /etc/envoy/bootstrap.yaml
     volumes:
       - ./envoy/bootstrap.yaml.tmpl:/etc/envoy/bootstrap.yaml.tmpl:ro
+      # File-based SDS secrets referenced by the SSO profiles' sds_path
+      # (sso-nas-hmac.yaml, sso-nas-token.yaml; format in docs/LABELS.md
+      # "SDS secret files"). Read by Envoy only; create both files before
+      # starting, or Envoy cannot bring up the HTTPS listener serving the
+      # SSO router.
+      - ./secrets/sso:/etc/envoy/secrets:ro
     ports:
       - "80:80"
       - "443:443"
@@ -135,6 +143,25 @@ services:
       envoy.http.routers.admin.subdomain: myapp-admin
       envoy.http.routers.admin.port: "80"
       envoy.http.routers.admin.entrypoints: admin
+    networks:
+      - proxy
+
+  # SSO demo: https://files.nas.pfrem.me is only reachable after logging in
+  # through the "nas" profile in config/sso.example.yaml. Machine clients can
+  # send "Authorization: Bearer <JWT from the same issuer>" instead.
+  files:
+    image: nginx:alpine
+    labels:
+      envoy.enable: "true"
+      envoy.http.routers.files.subdomain: files
+      envoy.http.routers.files.port: "80"
+      envoy.http.routers.files.sso: nas
+      # For long-lived, mostly quiet streams (SSE, long polling) disable the
+      # route's stream idle timeout (Envoy default 5m) and the route timeout:
+      #   envoy.http.routers.files.idletimeout: "0s"
+      #   envoy.http.routers.files.timeout: "0s"
+      # WebSocket upgrades are not proxied yet (see docs/LABELS.md
+      # "Protocol support"); the same idletimeout advice will apply to them.
     networks:
       - proxy
 
