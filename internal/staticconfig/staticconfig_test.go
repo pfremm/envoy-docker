@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bryanpfremm/envoy-control-plane/internal/model"
 )
 
 func TestLoad_EmptyPath(t *testing.T) {
@@ -84,6 +86,47 @@ func TestLoad_Errors(t *testing.T) {
 				t.Error("Load() expected error, got nil")
 			}
 		})
+	}
+}
+
+// TestLoad_ApexSubdomain: the DNS-zone style subdomain "@" (quoted: a bare
+// @ is reserved in YAML) loads as an ordinary route keyed "@", next to a
+// regular subdomain; xds serves it on the apex BASE_DOMAIN.
+func TestLoad_ApexSubdomain(t *testing.T) {
+	path := writeConfig(t, `
+routers:
+  - subdomain: "@"
+    port: 443
+    addresses: ["10.10.2.42"]
+    protocol: https
+    tls:
+      insecure_skip_verify: true
+  - subdomain: nas
+    port: 5000
+    addresses: ["192.168.1.10"]
+`)
+	routes, rejected, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if len(rejected) != 0 {
+		t.Fatalf("Load() rejected %+v, want none", rejected)
+	}
+	apex, ok := routes[model.ApexSubdomain]
+	if !ok || len(routes) != 2 {
+		t.Fatalf("Load() = %+v, want the apex route \"@\" and nas", routes)
+	}
+	if apex.Subdomain != model.ApexSubdomain || apex.Source != model.SourceStatic || apex.UpstreamTLS == nil || !apex.UpstreamTLS.InsecureSkipVerify {
+		t.Errorf("apex route = %+v", apex)
+	}
+	if got := apex.PublicHost("nas2.example.com"); got != "nas2.example.com" {
+		t.Errorf("apex PublicHost = %q, want nas2.example.com", got)
+	}
+
+	// "@" is unique like any other subdomain.
+	dup := writeConfig(t, `routers: [{subdomain: "@", port: 1, addresses: ["1.1.1.1"]}, {subdomain: "@", port: 2, addresses: ["2.2.2.2"]}]`)
+	if _, _, err := Load(dup); err == nil || !strings.Contains(err.Error(), "duplicate subdomain") {
+		t.Errorf("Load() duplicate \"@\" error = %v, want duplicate subdomain", err)
 	}
 }
 

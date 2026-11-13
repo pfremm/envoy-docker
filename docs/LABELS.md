@@ -509,7 +509,7 @@ on port `443`: a backend that serves HTTPS needs `protocol: https` (see
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `subdomain` | yes | The subdomain this router serves (`<subdomain>.<BASE_DOMAIN>`). Must be unique within the file. |
+| `subdomain` | yes | The subdomain this router serves (`<subdomain>.<BASE_DOMAIN>`). `"@"` (quoted: a bare `@` is not valid YAML) serves the apex `<BASE_DOMAIN>` itself. Must be unique within the file. |
 | `port` | yes | Backend port, used for every address. |
 | `addresses` | yes | List of backend addresses (at least one). Requests are load-balanced round-robin across them. |
 | `protocol` | no | `http` (default) or `https`, case-insensitive. `https` makes Envoy connect to the backend over TLS. |
@@ -517,12 +517,40 @@ on port `443`: a backend that serves HTTPS needs `protocol: https` (see
 
 `tls` is a mapping. `insecure_skip_verify` is its only key for now.
 
+Static routes are always public and never inherit SSO: each gets explicit
+disabled `oauth2`/`jwt_authn` overrides. A host with no matching route at
+all still falls through to the listener SSO filter.
+
+### Apex BASE_DOMAIN
+
+`subdomain: "@"` (DNS-zone style) makes the router serve the apex
+`<BASE_DOMAIN>` exactly, for example `nas2.example.com` itself rather than
+`<subdomain>.nas2.example.com`. Everything else behaves as for any other
+subdomain; with `protocol: https` the upstream SNI is `<BASE_DOMAIN>`. The
+listener certificate (`CERT_SECRET_NAME`) must cover the apex: a
+`*.<BASE_DOMAIN>` wildcard alone does not.
+
+```yaml
+routers:
+  - subdomain: "@"
+    port: 443
+    addresses:
+      - 192.168.1.10
+    protocol: https
+    tls:
+      insecure_skip_verify: true
+```
+
+`"@"` is only meant for the static file; a Docker router label `.subdomain=@` is not
+supported (it would resolve to the apex too, through the same host helper,
+never to `@.<BASE_DOMAIN>`).
+
 ### HTTPS upstreams
 
 With `protocol: https`, the router's cluster opens TLS to the backend:
 
 - **SNI** is the route's public host, `<subdomain>.<BASE_DOMAIN>` (for
-  example `nas.example.com`). The backend's own address is not used as SNI.
+  example `nas.example.com`), or `<BASE_DOMAIN>` for `subdomain: "@"`. The backend's own address is not used as SNI.
 - **Verification (default).** The backend's certificate chain is verified
   against the system CA bundle, `/etc/ssl/certs/ca-certificates.crt`. Only the
   chain is checked: Envoy does **not** check that the certificate's hostname

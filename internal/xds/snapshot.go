@@ -501,7 +501,7 @@ const systemCABundle = "/etc/ssl/certs/ca-certificates.crt"
 func buildRouteCluster(route model.Route, baseDomain string) *clusterv3.Cluster {
 	c := buildCluster(route.ClusterName())
 	if route.UpstreamTLS != nil {
-		c.TransportSocket = routeUpstreamTLS(subdomainHost(route, baseDomain), *route.UpstreamTLS)
+		c.TransportSocket = routeUpstreamTLS(route.PublicHost(baseDomain), *route.UpstreamTLS)
 	}
 	return c
 }
@@ -561,7 +561,8 @@ func buildClusterLoadAssignment(route model.Route) *endpointv3.ClusterLoadAssign
 //     what lets several routes (routers) share one host and be evaluated by
 //     precedence.
 //   - A legacy subdomain-only route (no rule) keeps the existing behavior:
-//     its own virtual host <subdomain>.<baseDomain> with a catch-all route.
+//     its own virtual host (Route.PublicHost: <subdomain>.<baseDomain>, or
+//     the apex <baseDomain> for subdomain "@") with a catch-all route.
 //
 // Within a virtual host, routes are ordered by model.SortByPrecedence (the
 // deterministic precedence: explicit priority, then rule specificity, then
@@ -587,7 +588,7 @@ func buildHTTPSRouteConfiguration(routes map[string]model.Route, names []string,
 			continue
 		}
 		hosts := route.Rule.Hosts()
-		host := subdomainHost(route, baseDomain)
+		host := route.PublicHost(baseDomain)
 		if len(hosts) > 0 {
 			host = hosts[0]
 		}
@@ -600,7 +601,7 @@ func buildHTTPSRouteConfiguration(routes map[string]model.Route, names []string,
 	// with a duplicate domain, which Envoy rejects at the RDS layer.
 	remaining := legacy[:0]
 	for _, route := range legacy {
-		host := subdomainHost(route, baseDomain)
+		host := route.PublicHost(baseDomain)
 		if _, shared := byHost[host]; shared {
 			byHost[host] = append(byHost[host], route)
 			continue
@@ -638,7 +639,7 @@ func buildHTTPSRouteConfiguration(routes map[string]model.Route, names []string,
 	legacyByHost := map[string][]model.Route{}
 	legacyHosts := make([]string, 0, len(legacy))
 	for _, route := range legacy {
-		host := subdomainHost(route, baseDomain)
+		host := route.PublicHost(baseDomain)
 		if _, seen := legacyByHost[host]; !seen {
 			legacyHosts = append(legacyHosts, host)
 		}
@@ -687,12 +688,6 @@ const (
 	catchAllDomain = "*"
 )
 
-// subdomainHost returns the legacy virtual host domain for a route:
-// <subdomain>.<baseDomain>.
-func subdomainHost(route model.Route, baseDomain string) string {
-	return route.Subdomain + "." + baseDomain
-}
-
 // buildLegacyCatchAllVirtualHost builds the "*" catch-all virtual host that
 // additionally carries the legacy routes when rule-based routes exist. Each
 // legacy route's copy is constrained to its own <subdomain>.<baseDomain>
@@ -706,7 +701,7 @@ func buildLegacyCatchAllVirtualHost(legacy []model.Route, baseDomain string, log
 		if generated == nil {
 			continue
 		}
-		host := subdomainHost(route, baseDomain)
+		host := route.PublicHost(baseDomain)
 		for _, er := range generated {
 			if er.Match == nil {
 				er.Match = &routev3.RouteMatch{}

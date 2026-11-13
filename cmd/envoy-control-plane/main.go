@@ -204,7 +204,7 @@ func buildInfoView(cfg config.Config, routes map[string]model.Route, version str
 		}
 		views = append(views, infoserver.Route{
 			Subdomain: route.Subdomain,
-			Host:      route.Subdomain + "." + cfg.BaseDomain,
+			Host:      route.PublicHost(cfg.BaseDomain),
 			Source:    string(route.Source),
 			Endpoints: endpoints,
 			Origin:    route.Origin,

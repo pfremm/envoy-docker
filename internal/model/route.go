@@ -132,6 +132,21 @@ func (r Route) String() string {
 	return fmt.Sprintf("%s (%s, %d endpoint(s), from %s)", r.Subdomain, r.Source, len(r.Endpoints), r.Origin)
 }
 
+// ApexSubdomain is the DNS-zone style subdomain that names the apex
+// BASE_DOMAIN itself instead of a <subdomain>.<BASE_DOMAIN> host.
+const ApexSubdomain = "@"
+
+// PublicHost returns the host this route serves: baseDomain itself for the
+// apex subdomain "@", otherwise <subdomain>.<baseDomain>. Every place that
+// derives a route's public host must use this so "@" never leaks into a
+// "@.<baseDomain>" host.
+func (r Route) PublicHost(baseDomain string) string {
+	if r.Subdomain == ApexSubdomain {
+		return baseDomain
+	}
+	return r.Subdomain + "." + baseDomain
+}
+
 // ClusterName returns the Envoy cluster/route name for this route. The
 // highest-precedence route of a subdomain keeps the legacy behavior (the
 // subdomain itself, which is unique per snapshot); a preserved

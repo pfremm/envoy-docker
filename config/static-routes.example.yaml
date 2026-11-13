@@ -9,3 +9,12 @@ routers:
   - subdomain: printer
     port: 631
     addresses: ["192.168.1.11"]
+
+  # The apex BASE_DOMAIN itself (e.g. https://nas2.example.com/): use the
+  # DNS-zone style subdomain "@" (quoted; a bare @ is not valid YAML).
+  # - subdomain: "@"
+  #   port: 443
+  #   addresses: ["192.168.1.10"]
+  #   protocol: https
+  #   tls:
+  #     insecure_skip_verify: true

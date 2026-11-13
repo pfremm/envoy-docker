@@ -117,6 +117,11 @@ func TestEnvoyValidatesSSOSnapshot(t *testing.T) {
 		"www":   route("www", ""),
 		"wsoff": wsoff,
 		"buf":   buf,
+		// A public static route on the apex BASE_DOMAIN next to SSO.
+		model.ApexSubdomain: {
+			Subdomain: model.ApexSubdomain, Source: model.SourceStatic, Origin: "static.yaml",
+			Endpoints: []model.Endpoint{{Address: "127.0.0.1", Port: upstreamPort}},
+		},
 	}, Middlewares: map[string]model.Middleware{"buf": bufMW}}, xds.Config{
 		BaseDomain: "example.com", HTTPPort: httpPort, HTTPSPort: httpsPort,
 		CertSecretName: "cert", ACMESDSClusterName: "acme", SSO: ssoCfg,
@@ -130,9 +135,9 @@ func TestEnvoyValidatesSSOSnapshot(t *testing.T) {
 
 // TestEnvoyValidatesHTTPSStaticRoutes renders static routes with an HTTPS
 // upstream (one verifying the backend against the system CA bundle, one with
-// tls.insecure_skip_verify) next to a plain HTTP static route into a static
-// bootstrap and runs `envoy --mode validate` on it. Same environment as
-// TestEnvoyValidatesSSOSnapshot: ENVOY_BIN (required), ENVOY_VALIDATE_DIR,
+// tls.insecure_skip_verify, plus an apex "@" one) next to a plain HTTP static
+// route into a static bootstrap and runs `envoy --mode validate` on it. Same
+// environment as TestEnvoyValidatesSSOSnapshot: ENVOY_BIN (required), ENVOY_VALIDATE_DIR,
 // ENVOY_VALIDATE_HTTPS_PORT/ENVOY_VALIDATE_HTTP_PORT and
 // ENVOY_VALIDATE_UPSTREAM_PORT (the routes point at 127.0.0.1:<port>).
 func TestEnvoyValidatesHTTPSStaticRoutes(t *testing.T) {
@@ -160,6 +165,8 @@ func TestEnvoyValidatesHTTPSStaticRoutes(t *testing.T) {
 		"plain":    route("plain", nil),
 		"secure":   route("secure", &model.UpstreamTLS{}),
 		"insecure": route("insecure", &model.UpstreamTLS{InsecureSkipVerify: true}),
+		// Apex BASE_DOMAIN (vhost domain and SNI example.com, cluster "@").
+		model.ApexSubdomain: route(model.ApexSubdomain, &model.UpstreamTLS{InsecureSkipVerify: true}),
 	}}, xds.Config{
 		BaseDomain: "example.com", HTTPPort: httpPort, HTTPSPort: httpsPort,
 		CertSecretName: "cert", ACMESDSClusterName: "acme",
