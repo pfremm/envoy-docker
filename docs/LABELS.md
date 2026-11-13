@@ -514,12 +514,43 @@ on port `443`: a backend that serves HTTPS needs `protocol: https` (see
 | `addresses` | yes | List of backend addresses (at least one). Requests are load-balanced round-robin across them. |
 | `protocol` | no | `http` (default) or `https`, case-insensitive. `https` makes Envoy connect to the backend over TLS. |
 | `tls.insecure_skip_verify` | no | `true`\|`false`, default `false`. Only valid with `protocol: https`. `true` accepts any backend certificate. |
+| `sso` | no | Name of an operator SSO profile (`SSO_CONFIG_PATH`), the static equivalent of the `.sso` router label. Puts the router's whole virtual host behind OAuth SSO. See [Static routes with SSO](#static-routes-with-sso). |
 
 `tls` is a mapping. `insecure_skip_verify` is its only key for now.
 
-Static routes are always public and never inherit SSO: each gets explicit
-disabled `oauth2`/`jwt_authn` overrides. A host with no matching route at
-all still falls through to the listener SSO filter.
+Static routes without `sso` are public and never inherit SSO: each gets
+explicit disabled `oauth2`/`jwt_authn` overrides. A host with no matching
+route at all still falls through to the listener SSO filter.
+
+### Static routes with SSO
+
+`sso: <profile>` opts a static router into an SSO profile exactly like the
+`envoy.http.routers.<name>.sso` label does for a Docker router: the same
+oauth2/jwt_authn filters, per-route requirements, callback routes, HSTS and
+IdP clusters (see [SSO](#sso-oauth2--jwt)). It combines freely with
+`protocol: https`, `tls` and `subdomain: "@"`; the upstream cluster and its
+TLS settings are unchanged by `sso`.
+
+```yaml
+routers:
+  - subdomain: dns
+    port: 443
+    addresses:
+      - 192.168.1.53
+    protocol: https
+    tls:
+      insecure_skip_verify: true
+    sso: cognito
+```
+
+The profile is checked when the snapshot is built, not when the file is
+read. If `SSO_CONFIG_PATH` is unset, the SSO file failed to load, or the
+profile is unknown or invalid, **only that router is rejected** (dropped,
+never served public) and logged at warning level (`skipping router: sso
+profile cannot be applied`, with `source=static`, its `origin` and
+`subdomain`); every other router still loads. An `sso` value that is not a
+string (a mapping or a list) rejects the router when the file is read (see
+[Static config validation](#static-config-validation)).
 
 ### Apex BASE_DOMAIN
 
@@ -580,8 +611,8 @@ Errors are either per-router or fatal for the whole file:
 - **Rejects only that router:** an unsupported `protocol` (anything but
   `http`/`https`) or a non-string one, a `tls` block on a router whose
   protocol is `http` (explicit or default), a `tls` value that is not a
-  mapping, an unknown key inside `tls`, and an `insecure_skip_verify` that is
-  not a boolean. The router is left out and logged at error level
+  mapping, an unknown key inside `tls`, an `insecure_skip_verify` that is
+  not a boolean, and an `sso` that is a mapping or a list. The router is left out and logged at error level
   (`rejecting static router`, with its `origin` as `<path>[<index>]`, its
   `subdomain` and the reason). The other routers in the file still load.
 - **Fatal for the whole file** (the control plane does not start): an
@@ -703,7 +734,9 @@ Routers can opt in to single sign-on with
 `envoy.http.routers.<name>.sso: <profile>`. Profiles are **operator**
 configuration in the YAML file named by the `SSO_CONFIG_PATH` environment
 variable (unset = SSO disabled); a label can only select a profile, never
-define one. Unlabeled routers stay fully public.
+define one. Unlabeled routers stay fully public. Static config routers opt
+in the same way with an `sso: <profile>` field (see
+[Static routes with SSO](#static-routes-with-sso)).
 
 ```yaml
 # /etc/envoy-control-plane/sso.yaml

@@ -54,8 +54,8 @@ func hstsHeader() *corev3.HeaderValueOption {
 	}
 }
 
-// filterSSORoutes rejects (only) the routers whose .sso label cannot be
-// honored: SSO_CONFIG_PATH unset, the file failed to load, or the profile is
+// filterSSORoutes rejects (only) the routers whose .sso label (or static
+// config sso field) cannot be honored: SSO_CONFIG_PATH unset, the file failed to load, or the profile is
 // unknown or invalid. A rejected router is dropped entirely rather than
 // served without SSO, so a misconfiguration fails closed.
 //
@@ -71,7 +71,7 @@ func filterSSORoutes(routes map[string]model.Route, cfg Config, logger *slog.Log
 			if _, err := cfg.SSO.Lookup(route.SSOProfile); err != nil {
 				if logger != nil {
 					logger.Warn("skipping router: sso profile cannot be applied",
-						"router", route.RouterName, "subdomain", route.Subdomain, "origin", route.Origin,
+						"source", route.Source, "router", route.RouterName, "subdomain", route.Subdomain, "origin", route.Origin,
 						"sso", route.SSOProfile, "error", err)
 				}
 				continue

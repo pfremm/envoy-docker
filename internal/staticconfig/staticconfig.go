@@ -37,8 +37,17 @@ type upstreamEntry struct {
 	TLS yaml.Node `yaml:"tls"`
 }
 
+// ssoEntry holds the router's optional SSO profile name. A wrongly typed
+// value (a mapping or list) rejects only its router.
+type ssoEntry struct {
+	// SSO names an operator SSO profile (SSO_CONFIG_PATH), the static
+	// equivalent of the envoy.http.routers.<name>.sso label. Empty means
+	// public.
+	SSO string `yaml:"sso"`
+}
+
 // Rejection describes one router that was skipped because of an invalid
-// protocol/tls setting. The other routers in the file still load.
+// protocol/tls/sso setting. The other routers in the file still load.
 type Rejection struct {
 	// Origin is the router's position in the file, as path[index].
 	Origin    string
@@ -51,9 +60,10 @@ type Rejection struct {
 //
 // File-level problems (unreadable file, YAML syntax error, a router missing
 // its subdomain/port/addresses or with a wrongly typed one, a duplicate
-// subdomain) are returned as an error. An invalid protocol or tls block only
-// rejects that router: it is left out of the map and reported in the
-// returned rejections.
+// subdomain) are returned as an error. An invalid protocol, tls block or
+// wrongly typed sso value only rejects that router: it is left out of the
+// map and reported in the returned rejections. Whether an sso profile exists
+// is checked later, at snapshot build time (see xds filterSSORoutes).
 func Load(path string) (map[string]model.Route, []Rejection, error) {
 	routes := map[string]model.Route{}
 	if path == "" {
@@ -101,6 +111,11 @@ func Load(path string) (map[string]model.Route, []Rejection, error) {
 			rejections = append(rejections, Rejection{Origin: origin, Subdomain: r.Subdomain, Reason: err.Error()})
 			continue
 		}
+		var s ssoEntry
+		if err := node.Decode(&s); err != nil {
+			rejections = append(rejections, Rejection{Origin: origin, Subdomain: r.Subdomain, Reason: fmt.Sprintf("sso must be a profile name: %v", err)})
+			continue
+		}
 
 		endpoints := make([]model.Endpoint, 0, len(r.Addresses))
 		for _, addr := range r.Addresses {
@@ -113,6 +128,7 @@ func Load(path string) (map[string]model.Route, []Rejection, error) {
 			Source:      model.SourceStatic,
 			Origin:      origin,
 			UpstreamTLS: upstreamTLS,
+			SSOProfile:  s.SSO,
 		}
 	}
 

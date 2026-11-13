@@ -223,6 +223,8 @@ func TestLoad_RejectsRouterInIsolation(t *testing.T) {
 		{"insecure_skip_verify wrong type", "protocol: https\n    tls: {insecure_skip_verify: maybe}", "insecure_skip_verify must be true or false"},
 		{"unknown tls key", "protocol: https\n    tls: {insecure: true}", `unknown tls key "insecure"`},
 		{"tls not a mapping", "protocol: https\n    tls: true", "tls must be a mapping"},
+		{"sso mapping", `sso: {profile: nas}`, "sso must be a profile name"},
+		{"sso list", `sso: [nas]`, "sso must be a profile name"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -338,6 +340,59 @@ routers:
 				t.Errorf("rejected subdomains = %v, want %v", got, tt.rejected)
 			}
 		})
+	}
+}
+
+// TestLoad_SSO checks the optional sso field: a profile name is carried
+// into the route's SSOProfile (with or without an https upstream); absent
+// or null means public. Whether the profile exists is checked at snapshot
+// build time, not here.
+func TestLoad_SSO(t *testing.T) {
+	routes, rejected, err := Load(writeConfig(t, `
+routers:
+  - subdomain: dns
+    port: 443
+    addresses: ["10.10.2.53"]
+    protocol: https
+    tls: {insecure_skip_verify: true}
+    sso: cognito
+  - subdomain: nas
+    port: 5000
+    addresses: ["10.0.0.1"]
+    sso: nas
+  - subdomain: "@"
+    port: 80
+    addresses: ["10.0.0.2"]
+    sso: cognito
+  - subdomain: public
+    port: 80
+    addresses: ["10.0.0.3"]
+  - subdomain: nullsso
+    port: 80
+    addresses: ["10.0.0.4"]
+    sso: ~
+  - subdomain: unknown
+    port: 80
+    addresses: ["10.0.0.5"]
+    sso: no-such-profile
+`))
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if len(rejected) != 0 {
+		t.Fatalf("Load() rejected %+v, want none", rejected)
+	}
+	want := map[string]string{"dns": "cognito", "nas": "nas", model.ApexSubdomain: "cognito", "public": "", "nullsso": "", "unknown": "no-such-profile"}
+	if len(routes) != len(want) {
+		t.Fatalf("Load() = %d routes, want %d: %+v", len(routes), len(want), routes)
+	}
+	for name, profile := range want {
+		if got := routes[name].SSOProfile; got != profile {
+			t.Errorf("%s: SSOProfile = %q, want %q", name, got, profile)
+		}
+	}
+	if tls := routes["dns"].UpstreamTLS; tls == nil || !tls.InsecureSkipVerify {
+		t.Errorf("dns: UpstreamTLS = %+v, want InsecureSkipVerify=true alongside sso", tls)
 	}
 }
 

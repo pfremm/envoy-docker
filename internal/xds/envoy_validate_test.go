@@ -122,6 +122,13 @@ func TestEnvoyValidatesSSOSnapshot(t *testing.T) {
 			Subdomain: model.ApexSubdomain, Source: model.SourceStatic, Origin: "static.yaml",
 			Endpoints: []model.Endpoint{{Address: "127.0.0.1", Port: upstreamPort}},
 		},
+		// A static route opted into SSO through the static file's sso
+		// field, with an HTTPS upstream (crafty/dns style).
+		"dns": {
+			Subdomain: "dns", Source: model.SourceStatic, Origin: "static.yaml", SSOProfile: "nas",
+			UpstreamTLS: &model.UpstreamTLS{InsecureSkipVerify: true},
+			Endpoints:   []model.Endpoint{{Address: "127.0.0.1", Port: upstreamPort}},
+		},
 	}, Middlewares: map[string]model.Middleware{"buf": bufMW}}, xds.Config{
 		BaseDomain: "example.com", HTTPPort: httpPort, HTTPSPort: httpsPort,
 		CertSecretName: "cert", ACMESDSClusterName: "acme", SSO: ssoCfg,
