@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"log/slog"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
 
+	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -428,6 +430,79 @@ func TestSSOSnapshot_ProtectedResourceMetadataRoutes(t *testing.T) {
 				t.Errorf("metadata route on non-sso host: %q", er.Name)
 			}
 		}
+	}
+}
+
+func TestSSOSnapshot_ChallengeHeaderOnSSOHosts(t *testing.T) {
+	// 401 local replies on an sso host carry the RFC 9728 challenge; the
+	// mapper is scoped to that host so other hosts' 401s are untouched.
+	snap, err := BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{
+		"app": ssoRoute("app", "nas"),
+		"www": ssoRoute("www", ""),
+	}}, ssoTestConfig(testSSOConfig(t, "nas")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hcm := httpsHCM(t, snap)
+	if err := hcm.ValidateAll(); err != nil {
+		t.Fatalf("HCM fails proto validation: %v", err)
+	}
+	lrc := hcm.GetLocalReplyConfig()
+	if lrc == nil || len(lrc.GetMappers()) != 1 {
+		t.Fatalf("local_reply_config = %v, want exactly one mapper (one sso host)", lrc)
+	}
+	m := lrc.GetMappers()[0]
+	if m.GetStatusCode() != nil || m.GetBody() != nil {
+		t.Errorf("mapper must only add headers, got status=%v body=%v", m.GetStatusCode(), m.GetBody())
+	}
+	and := m.GetFilter().GetAndFilter()
+	if and == nil || len(and.GetFilters()) != 2 {
+		t.Fatalf("mapper filter = %v, want and(status, authority)", m.GetFilter())
+	}
+	cmp := and.GetFilters()[0].GetStatusCodeFilter().GetComparison()
+	if cmp.GetOp() != accesslogv3.ComparisonFilter_EQ || cmp.GetValue().GetDefaultValue() != 401 {
+		t.Errorf("status filter = %v, want EQ 401", cmp)
+	}
+	hm := and.GetFilters()[1].GetHeaderFilter().GetHeader()
+	if hm.GetName() != ":authority" {
+		t.Fatalf("header filter name = %q, want :authority", hm.GetName())
+	}
+	re := regexp.MustCompile(hm.GetStringMatch().GetSafeRegex().GetRegex())
+	for authority, want := range map[string]bool{
+		"app.example.com":          true,
+		"APP.Example.com":          true,
+		"app.example.com:443":      true,
+		"www.example.com":          false,
+		"xapp.example.com":         false,
+		"app.example.com.evil.net": false,
+		"app.example.com:443x":     false,
+	} {
+		if got := re.MatchString(authority); got != want {
+			t.Errorf("authority %q matched=%v, want %v", authority, got, want)
+		}
+	}
+	hdrs := m.GetHeadersToAdd()
+	if len(hdrs) != 1 {
+		t.Fatalf("headers_to_add = %v, want one WWW-Authenticate", hdrs)
+	}
+	wantVal := `Bearer resource_metadata="https://app.example.com/.well-known/oauth-protected-resource"`
+	if hdrs[0].GetHeader().GetKey() != "WWW-Authenticate" || hdrs[0].GetHeader().GetValue() != wantVal {
+		t.Errorf("header = %v, want WWW-Authenticate: %s", hdrs[0].GetHeader(), wantVal)
+	}
+	if hdrs[0].GetAppendAction() != corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD {
+		t.Errorf("append_action = %v, want APPEND_IF_EXISTS_OR_ADD (keep jwt_authn's challenge)", hdrs[0].GetAppendAction())
+	}
+}
+
+func TestSSOSnapshot_NoChallengeWithoutSSO(t *testing.T) {
+	snap, err := BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{
+		"www": ssoRoute("www", ""),
+	}}, ssoTestConfig(testSSOConfig(t, "nas")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lrc := httpsHCM(t, snap).GetLocalReplyConfig(); lrc != nil {
+		t.Fatalf("local_reply_config = %v, want nil on a listener with no sso host", lrc)
 	}
 }
 
