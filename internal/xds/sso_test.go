@@ -2,6 +2,7 @@ package xds
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"reflect"
 	"sort"
@@ -350,6 +351,83 @@ func TestSSOSnapshot_WholeVirtualHostIsProtected(t *testing.T) {
 	er := routesByName(httpsRouteConfig(t, snap))["app-public"]
 	if er == nil || oauth2Disabled(t, er, "nas") || jwtPerRoute(t, er).GetRequirementName() != "nas" {
 		t.Fatalf("unlabeled router sharing an SSO host must be protected")
+	}
+}
+
+func TestSSOSnapshot_ProtectedResourceMetadataRoutes(t *testing.T) {
+	// Every sso-enabled virtual host serves the RFC 9728 protected resource
+	// metadata document (root and path-inserted well-known variants) with
+	// every sso filter disabled, so MCP clients can bootstrap OAuth
+	// discovery from a bare 401.
+	snap, err := BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{
+		"app": ssoRoute("app", "nas"),
+	}}, ssoTestConfig(testSSOConfig(t, "nas")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc := httpsRouteConfig(t, snap)
+	cfg := ssoTestConfig(testSSOConfig(t, "nas"))
+	prof, err := cfg.SSO.Lookup("nas")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vh := vhostByDomain(rc, "app.example.com")
+	if vh == nil {
+		t.Fatal("no app.example.com vhost")
+	}
+	wantPaths := map[string]bool{
+		ssoProtectedResourceWellKnownPath:          false,
+		ssoProtectedResourceWellKnownPath + "/mcp": false,
+	}
+	for _, er := range vh.Routes {
+		if !strings.HasPrefix(er.Name, ssoMetadataRoutePrefix) {
+			continue
+		}
+		path := er.Match.GetPrefix()
+		_, seen := wantPaths[path]
+		if !seen {
+			t.Fatalf("unexpected metadata route %q (path %q)", er.Name, path)
+		}
+		wantPaths[path] = true
+		dr := er.GetDirectResponse()
+		if dr == nil || dr.GetStatus() != 200 {
+			t.Fatalf("metadata route %q: want 200 direct response, got %v", er.Name, dr)
+		}
+		body := dr.GetBody().GetInlineString()
+		var doc struct {
+			Resource             string   `json:"resource"`
+			AuthorizationServers []string `json:"authorization_servers"`
+			ScopesSupported      []string `json:"scopes_supported"`
+		}
+		if err := json.Unmarshal([]byte(body), &doc); err != nil {
+			t.Fatalf("metadata route %q body is not JSON: %v (%q)", er.Name, err, body)
+		}
+		if doc.Resource != "https://app.example.com" {
+			t.Errorf("resource = %q, want https://app.example.com", doc.Resource)
+		}
+		if len(doc.AuthorizationServers) != 1 || doc.AuthorizationServers[0] != prof.Issuer {
+			t.Errorf("authorization_servers = %v, want [%s]", doc.AuthorizationServers, prof.Issuer)
+		}
+		if strings.Join(doc.ScopesSupported, ",") != strings.Join(prof.AuthScopes, ",") {
+			t.Errorf("scopes_supported = %v, want %v", doc.ScopesSupported, prof.AuthScopes)
+		}
+		if !oauth2Disabled(t, er, "nas") || !jwtPerRoute(t, er).GetDisabled() {
+			t.Errorf("metadata route %q must disable oauth2 and jwt_authn", er.Name)
+		}
+	}
+	for path, seen := range wantPaths {
+		if !seen {
+			t.Errorf("metadata route for %q missing", path)
+		}
+	}
+	// The metadata document must not appear on hosts without an sso router.
+	if vh := vhostByDomain(rc, "truenas.example.com"); vh != nil {
+		for _, er := range vh.Routes {
+			if strings.HasPrefix(er.Name, ssoMetadataRoutePrefix) {
+				t.Errorf("metadata route on non-sso host: %q", er.Name)
+			}
+		}
 	}
 }
 

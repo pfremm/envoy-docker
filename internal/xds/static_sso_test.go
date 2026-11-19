@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	"google.golang.org/protobuf/proto"
@@ -187,16 +188,25 @@ func TestStaticSSO_ApexWithCallbackHost(t *testing.T) {
 		}
 	}
 	vh := vhostByDomain(rc, "example.com")
-	if vh == nil || len(vh.Routes) != 3 {
-		t.Fatalf("apex vhost = %v, want callback + signout + apex route", vh)
+	if vh == nil {
+		t.Fatalf("apex vhost missing")
+	}
+	var appRoutes []*routev3.Route
+	for _, er := range vh.Routes {
+		if !strings.HasPrefix(er.Name, ssoMetadataRoutePrefix) {
+			appRoutes = append(appRoutes, er)
+		}
+	}
+	if len(appRoutes) != 3 {
+		t.Fatalf("apex vhost = %v, want callback + signout + apex route (plus metadata)", vh)
 	}
 	for i, path := range []string{"/oauth2/callback", "/oauth2/signout"} {
-		er := vh.Routes[i]
+		er := appRoutes[i]
 		if er.Match.GetPath() != path || oauth2Disabled(t, er, "nas") || !jwtPerRoute(t, er).GetDisabled() {
 			t.Errorf("apex vhost route %d = %v, want %s with oauth2.nas enabled and jwt disabled", i, er.Match, path)
 		}
 	}
-	app := vh.Routes[2]
+	app := appRoutes[2]
 	if app.GetRoute().GetCluster() != model.ApexSubdomain || oauth2Disabled(t, app, "nas") || jwtPerRoute(t, app).GetRequirementName() != "nas" {
 		t.Errorf("apex route %v: want apex cluster with oauth2.nas and jwt requirement nas", app)
 	}

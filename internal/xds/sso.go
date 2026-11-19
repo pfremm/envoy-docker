@@ -1,6 +1,7 @@
 package xds
 
 import (
+	"encoding/json"
 	"log/slog"
 	"strings"
 
@@ -33,6 +34,17 @@ const (
 	// ssoCallbackVHPrefix names the virtual host synthesized for a
 	// redirect_uri_host no router serves.
 	ssoCallbackVHPrefix = "sso_callback__"
+
+	// ssoProtectedResourceWellKnownPath is the RFC 9728 well-known path for
+	// protected resource metadata, served on every sso-enabled virtual host.
+	// The prefix form also covers the path-inserted variant (e.g.
+	// /.well-known/oauth-protected-resource/mcp) MCP clients try for resource
+	// URLs with a path component.
+	ssoProtectedResourceWellKnownPath = "/.well-known/oauth-protected-resource"
+
+	// ssoMetadataRoutePrefix names the virtual host routes serving the
+	// protected resource metadata document.
+	ssoMetadataRoutePrefix = "sso_prm__"
 )
 
 func oauth2FilterName(profile string) string { return oauth2FilterPrefix + profile }
@@ -218,6 +230,24 @@ func applySSOToRouteConfig(rc *routev3.RouteConfiguration, profileByRoute map[st
 			}
 		}
 	}
+
+	// RFC 9728 protected resource metadata: served on every sso-enabled
+	// virtual host so MCP clients can bootstrap OAuth discovery from a 401.
+	firstProfileByHost := map[string]sso.Profile{}
+	for _, vh := range rc.VirtualHosts {
+		if vh.Name == catchAllVHName || strings.HasPrefix(vh.Name, ssoCallbackVHPrefix) || len(vh.Routes) == 0 {
+			continue
+		}
+		for _, er := range vh.Routes {
+			if name, ok := assigned[er]; ok {
+				if p, err := cfg.Lookup(name); err == nil {
+					firstProfileByHost[firstVirtualHostDomain(vh)] = p
+				}
+				break
+			}
+		}
+	}
+	addProtectedResourceMetadataRoutes(rc, firstProfileByHost, profiles)
 	return profiles
 }
 
@@ -277,6 +307,94 @@ func addSSOCallbackRoutes(rc *routev3.RouteConfiguration, profiles []sso.Profile
 		})
 	}
 	return callbacks
+}
+
+// protectedResourceMetadataJSON builds the RFC 9728 protected resource
+// metadata document for a virtual host protected by profile p. The document
+// is public: it names the resource, the issuer whose tokens are accepted
+// for it, and the scopes the browser flow requests. Clients resolve the
+// authorization server metadata from the issuer (falling back to OIDC
+// discovery where needed).
+func protectedResourceMetadataJSON(domain string, p sso.Profile) string {
+	doc := struct {
+		Resource               string   `json:"resource"`
+		AuthorizationServers   []string `json:"authorization_servers"`
+		ScopesSupported        []string `json:"scopes_supported"`
+		BearerMethodsSupported []string `json:"bearer_methods_supported"`
+	}{
+		Resource:               "https://" + domain,
+		AuthorizationServers:   []string{p.Issuer},
+		ScopesSupported:        append([]string(nil), p.AuthScopes...),
+		BearerMethodsSupported: []string{"header"},
+	}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		// These field types cannot fail to marshal; keep the route servable.
+		return "{}"
+	}
+	return string(b)
+}
+
+// addProtectedResourceMetadataRoutes serves the RFC 9728 protected resource
+// metadata document on every sso-enabled virtual host (the root well-known
+// path and the path-inserted variant), so MCP clients can bootstrap OAuth
+// discovery from a bare 401. The document is public: on these routes every
+// sso filter is disabled (oauth2 would otherwise redirect the metadata
+// fetch to the login flow, and jwt_authn would reject it), and they are
+// prepended so they take precedence over the host's prefix routes. Call
+// after the per-route oauth2/jwt_authn assignments are complete.
+func addProtectedResourceMetadataRoutes(rc *routev3.RouteConfiguration, byHost map[string]sso.Profile, profiles []sso.Profile) {
+	if len(byHost) == 0 {
+		return
+	}
+	for _, domain := range sortedStringKeys(byHost) {
+		p := byHost[domain]
+		body := protectedResourceMetadataJSON(domain, p)
+		var metaRoutes []*routev3.Route
+		for _, path := range []string{ssoProtectedResourceWellKnownPath, ssoProtectedResourceWellKnownPath + "/mcp"} {
+			overrides := map[string]*anypb.Any{}
+			for _, prof := range profiles {
+				overrides[oauth2FilterName(prof.Name)] = mustAny(&routev3.FilterConfig{Disabled: true})
+			}
+			overrides[jwtAuthnFilterName] = mustAny(&jwtauthnv3.PerRouteConfig{
+				RequirementSpecifier: &jwtauthnv3.PerRouteConfig_Disabled{Disabled: true},
+			})
+			metaRoutes = append(metaRoutes, &routev3.Route{
+				Name:  ssoMetadataRoutePrefix + domain + path,
+				Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: path}},
+				Action: &routev3.Route_DirectResponse{DirectResponse: &routev3.DirectResponseAction{
+					Status: 200,
+					Body:   &corev3.DataSource{Specifier: &corev3.DataSource_InlineString{InlineString: body}},
+				}},
+				ResponseHeadersToAdd: []*corev3.HeaderValueOption{{
+					Header:       &corev3.HeaderValue{Key: "Content-Type", Value: "application/json"},
+					AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+				}},
+				TypedPerFilterConfig: overrides,
+			})
+		}
+		var existing *routev3.VirtualHost
+		for _, vh := range rc.VirtualHosts {
+			for _, d := range vh.Domains {
+				if strings.EqualFold(d, domain) {
+					existing = vh
+				}
+			}
+		}
+		if existing == nil {
+			continue
+		}
+		existing.Routes = append(metaRoutes, existing.Routes...)
+	}
+}
+
+// firstVirtualHostDomain returns the vhost's first domain (lowercased), the
+// canonical public host name of the virtual host.
+func firstVirtualHostDomain(vh *routev3.VirtualHost) string {
+	if len(vh.Domains) == 0 {
+		return ""
+	}
+	return strings.ToLower(vh.Domains[0])
 }
 
 // ssoHTTPFilters returns the HSTS header_mutation filter, the oauth2
