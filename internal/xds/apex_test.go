@@ -214,6 +214,9 @@ func TestSSOSnapshot_StaticRoutesNeverInheritSSO(t *testing.T) {
 				t.Fatal("no routes for secured.example.com")
 			}
 			for _, er := range sec.Routes {
+				if strings.HasPrefix(er.Name, ssoMetadataRoutePrefix) {
+					continue // RFC 9728 metadata routes are intentionally public
+				}
 				if oauth2Disabled(t, er, "nas") {
 					t.Errorf("sso route %q disables its oauth2.nas", er.Name)
 				}
