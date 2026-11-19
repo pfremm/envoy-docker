@@ -377,7 +377,7 @@ func TestSSOSnapshot_ProtectedResourceMetadataRoutes(t *testing.T) {
 		t.Fatal("no app.example.com vhost")
 	}
 	wantPaths := map[string]bool{
-		ssoProtectedResourceWellKnownPath:           false,
+		ssoProtectedResourceWellKnownPath:          false,
 		ssoProtectedResourceWellKnownPath + "/mcp": false,
 	}
 	for _, er := range vh.Routes {

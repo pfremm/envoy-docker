@@ -360,8 +360,8 @@ func addProtectedResourceMetadataRoutes(rc *routev3.RouteConfiguration, byHost m
 				RequirementSpecifier: &jwtauthnv3.PerRouteConfig_Disabled{Disabled: true},
 			})
 			metaRoutes = append(metaRoutes, &routev3.Route{
-				Name:   ssoMetadataRoutePrefix + domain + path,
-				Match:  &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: path}},
+				Name:  ssoMetadataRoutePrefix + domain + path,
+				Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: path}},
 				Action: &routev3.Route_DirectResponse{DirectResponse: &routev3.DirectResponseAction{
 					Status: 200,
 					Body:   &corev3.DataSource{Specifier: &corev3.DataSource_InlineString{InlineString: body}},
