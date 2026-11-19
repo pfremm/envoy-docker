@@ -3,8 +3,10 @@ package xds
 import (
 	"encoding/json"
 	"log/slog"
+	"regexp"
 	"strings"
 
+	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	mutationrulesv3 "github.com/envoyproxy/go-control-plane/envoy/config/common/mutation_rules/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -99,7 +101,11 @@ func filterSSORoutes(routes map[string]model.Route, cfg Config, logger *slog.Log
 // clusters to emit.
 type ssoPlan struct {
 	byRouteConfig map[string][]sso.Profile
-	clusters      []*clusterv3.Cluster
+	// hostsByRouteConfig lists, per route configuration, the sso-enabled
+	// virtual host domains (sorted). The HTTPS listener serving that route
+	// config stamps the RFC 9728 challenge on their jwt_authn 401s.
+	hostsByRouteConfig map[string][]string
+	clusters           []*clusterv3.Cluster
 }
 
 // planSSO assigns profiles to virtual hosts, writes the per-route oauth2 /
@@ -114,7 +120,7 @@ type ssoPlan struct {
 // the IdP, no TLS handshakes) and keeps the output of SSO-free deployments
 // identical to before.
 func planSSO(rcs []*routev3.RouteConfiguration, published map[string]model.Route, cfg Config, logger *slog.Logger) *ssoPlan {
-	plan := &ssoPlan{byRouteConfig: map[string][]sso.Profile{}}
+	plan := &ssoPlan{byRouteConfig: map[string][]sso.Profile{}, hostsByRouteConfig: map[string][]string{}}
 	if cfg.SSO == nil {
 		return plan
 	}
@@ -129,11 +135,14 @@ func planSSO(rcs []*routev3.RouteConfiguration, published map[string]model.Route
 	}
 	usedAnywhere := map[string]sso.Profile{}
 	for _, rc := range rcs {
-		profiles := applySSOToRouteConfig(rc, profileByRoute, cfg.SSO, logger)
+		profiles, hosts := applySSOToRouteConfig(rc, profileByRoute, cfg.SSO, logger)
 		if len(profiles) == 0 {
 			continue
 		}
 		plan.byRouteConfig[rc.Name] = profiles
+		if len(hosts) > 0 {
+			plan.hostsByRouteConfig[rc.Name] = hosts
+		}
 		for _, p := range profiles {
 			usedAnywhere[p.Name] = p
 		}
@@ -143,14 +152,15 @@ func planSSO(rcs []*routev3.RouteConfiguration, published map[string]model.Route
 }
 
 // applySSOToRouteConfig applies SSO to one route configuration and returns
-// the profiles it uses (sorted by name).
+// the profiles it uses (sorted by name) and the sso-enabled virtual host
+// domains (sorted).
 //
 // SSO is whole-virtual-host: if any router on a virtual host opts in, every
 // route on that host is protected, so a public router sharing a host with an
 // SSO router cannot silently expose part of the subdomain. Should two
 // routers on one host name different profiles, each keeps its own and the
 // host's unlabeled routes take the alphabetically first one (logged).
-func applySSOToRouteConfig(rc *routev3.RouteConfiguration, profileByRoute map[string]string, cfg *sso.Config, logger *slog.Logger) []sso.Profile {
+func applySSOToRouteConfig(rc *routev3.RouteConfiguration, profileByRoute map[string]string, cfg *sso.Config, logger *slog.Logger) ([]sso.Profile, []string) {
 	assigned := map[*routev3.Route]string{}
 	used := map[string]bool{}
 	for _, vh := range rc.VirtualHosts {
@@ -189,7 +199,7 @@ func applySSOToRouteConfig(rc *routev3.RouteConfiguration, profileByRoute map[st
 		}
 	}
 	if len(used) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	profiles := make([]sso.Profile, 0, len(used))
@@ -248,7 +258,7 @@ func applySSOToRouteConfig(rc *routev3.RouteConfiguration, profileByRoute map[st
 		}
 	}
 	addProtectedResourceMetadataRoutes(rc, firstProfileByHost, profiles)
-	return profiles
+	return profiles, sortedStringKeys(firstProfileByHost)
 }
 
 // addSSOCallbackRoutes makes each profile's redirect_path and signout_path
@@ -395,6 +405,72 @@ func firstVirtualHostDomain(vh *routev3.VirtualHost) string {
 		return ""
 	}
 	return strings.ToLower(vh.Domains[0])
+}
+
+// ssoChallengeRuntimeKey is the (optional) runtime override key for the
+// status code the challenge mappers match. It only exists because
+// ComparisonFilter takes a RuntimeUInt32; nothing is expected to set it.
+const ssoChallengeRuntimeKey = "sso_challenge.status_code"
+
+// protectedResourceMetadataURL is the absolute URL of the RFC 9728 document
+// served on an sso host (see addProtectedResourceMetadataRoutes).
+func protectedResourceMetadataURL(domain string) string {
+	return "https://" + domain + ssoProtectedResourceWellKnownPath
+}
+
+// ssoChallengeLocalReplyConfig makes every 401 local reply on an sso-enabled
+// host carry the MCP / RFC 9728 challenge
+//
+//	WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource"
+//
+// so a client that receives a 401 learns where to discover the
+// authorization server. On sso routes the 401 comes from jwt_authn (a
+// missing or invalid bearer token); browsers never see it because the oauth2
+// filter redirects them to the IdP first.
+//
+// The HCM is shared by every host on the listener, so each mapper is scoped
+// to one sso host by :authority (exact host, optional :port, case-insensitive):
+// a basic-auth or ForwardAuth 401 on another host is left untouched. The
+// challenge is appended, not substituted, so jwt_authn's own
+// WWW-Authenticate (with error="invalid_token" for a bad token) is kept.
+// Returns nil when there are no sso hosts.
+func ssoChallengeLocalReplyConfig(hosts []string) *hcmv3.LocalReplyConfig {
+	if len(hosts) == 0 {
+		return nil
+	}
+	mappers := make([]*hcmv3.ResponseMapper, 0, len(hosts))
+	for _, host := range hosts {
+		mappers = append(mappers, &hcmv3.ResponseMapper{
+			Filter: &accesslogv3.AccessLogFilter{FilterSpecifier: &accesslogv3.AccessLogFilter_AndFilter{
+				AndFilter: &accesslogv3.AndFilter{Filters: []*accesslogv3.AccessLogFilter{
+					{FilterSpecifier: &accesslogv3.AccessLogFilter_StatusCodeFilter{StatusCodeFilter: &accesslogv3.StatusCodeFilter{
+						Comparison: &accesslogv3.ComparisonFilter{
+							Op:    accesslogv3.ComparisonFilter_EQ,
+							Value: &corev3.RuntimeUInt32{DefaultValue: 401, RuntimeKey: ssoChallengeRuntimeKey},
+						},
+					}}},
+					{FilterSpecifier: &accesslogv3.AccessLogFilter_HeaderFilter{HeaderFilter: &accesslogv3.HeaderFilter{
+						Header: &routev3.HeaderMatcher{
+							Name: ":authority",
+							HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{StringMatch: &matcherv3.StringMatcher{
+								MatchPattern: &matcherv3.StringMatcher_SafeRegex{SafeRegex: &matcherv3.RegexMatcher{
+									Regex: `(?i)^` + regexp.QuoteMeta(host) + `(:[0-9]+)?$`,
+								}},
+							}},
+						},
+					}}},
+				}},
+			}},
+			HeadersToAdd: []*corev3.HeaderValueOption{{
+				Header: &corev3.HeaderValue{
+					Key:   "WWW-Authenticate",
+					Value: `Bearer resource_metadata="` + protectedResourceMetadataURL(host) + `"`,
+				},
+				AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+			}},
+		})
+	}
+	return &hcmv3.LocalReplyConfig{Mappers: mappers}
 }
 
 // ssoHTTPFilters returns the HSTS header_mutation filter, the oauth2

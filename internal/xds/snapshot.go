@@ -292,7 +292,7 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 	// its own RDS route config.
 	listeners := []cachetypes.Resource{
 		buildHTTPListener(cfg.HTTPPort, cfg.HTTPSPort),
-		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName]),
+		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName], ssoP.hostsByRouteConfig[httpsRouteConfigName]),
 	}
 	for _, ep := range entrypointNames {
 		if ep == defaultEntrypointName {
@@ -304,7 +304,7 @@ func BuildSnapshotWithLoggerAndTCP(version string, routes map[string]model.Route
 		}
 		listeners = append(listeners, buildHTTPSListener(
 			httpsListenerName+"__"+ep, port, httpsRouteConfigName+"__"+ep,
-			cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName+"__"+ep]))
+			cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName+"__"+ep], ssoP.hostsByRouteConfig[httpsRouteConfigName+"__"+ep]))
 	}
 
 	tcpListeners, tcpClusters, tcpEndpoints, err := buildTCPResources(tcpCfg, cfg, logger)
@@ -1147,7 +1147,7 @@ func buildHTTPListener(port, httpsPort uint32) *listenerv3.Listener {
 // referenced here only by cluster name + secret name. listenerName names the
 // generated listener (the default entrypoint uses the legacy "https_listener";
 // extra entrypoints use "https_listener__<entrypoint>").
-func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certSecretName, acmeSDSClusterName string, plan *securityPlan, ssoProfiles []sso.Profile) *listenerv3.Listener {
+func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certSecretName, acmeSDSClusterName string, plan *securityPlan, ssoProfiles []sso.Profile, ssoHosts []string) *listenerv3.Listener {
 	// SSO (HSTS, oauth2 per profile, then jwt_authn) runs first: an
 	// unauthenticated request is redirected to the IdP before any other
 	// filter acts on it.
@@ -1227,6 +1227,8 @@ func buildHTTPSListener(listenerName string, port uint32, routeConfigName, certS
 		// routers opt out with .websocket=false (applyRouteWebSocket).
 		// Without this, Envoy rejects `Upgrade: websocket` with 403.
 		UpgradeConfigs: []*hcmv3.HttpConnectionManager_UpgradeConfig{{UpgradeType: websocketUpgradeType}},
+		// RFC 9728 challenge on sso hosts' 401s (nil without sso hosts).
+		LocalReplyConfig: ssoChallengeLocalReplyConfig(ssoHosts),
 	}
 	if plan.xffNumTrustedHops > 0 {
 		// Honor the ipstrategy.depth of the IP allow/deny middleware: trust

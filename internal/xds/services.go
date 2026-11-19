@@ -339,7 +339,7 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 	// its own RDS route config.
 	listeners := []cachetypes.Resource{
 		buildHTTPListener(cfg.HTTPPort, cfg.HTTPSPort),
-		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName]),
+		buildHTTPSListener(httpsListenerName, cfg.HTTPSPort, httpsRouteConfigName, cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName], ssoP.hostsByRouteConfig[httpsRouteConfigName]),
 	}
 	for _, ep := range entrypointNames {
 		if ep == defaultEntrypointName {
@@ -351,7 +351,7 @@ func BuildSnapshotForConfigWithTCP(version string, httpCfg model.HTTPConfigurati
 		}
 		listeners = append(listeners, buildHTTPSListener(
 			httpsListenerName+"__"+ep, port, httpsRouteConfigName+"__"+ep,
-			cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName+"__"+ep]))
+			cfg.CertSecretName, cfg.ACMESDSClusterName, plan, ssoP.byRouteConfig[httpsRouteConfigName+"__"+ep], ssoP.hostsByRouteConfig[httpsRouteConfigName+"__"+ep]))
 	}
 	listeners = append(listeners, tcpListeners...)
 
