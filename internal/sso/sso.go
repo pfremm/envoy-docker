@@ -101,6 +101,34 @@ type Profile struct {
 	ClientSecret Secret
 	AuthScopes   []string
 	PassThrough  PassThroughMatcher
+	// Mode is ModeBrowser (oauth2 login flow + jwt_authn) or ModeBearer
+	// (jwt_authn only: no login redirect, a missing token gets a 401). A
+	// bearer profile only uses Issuer, JWKS, AuthScopes and
+	// AllowedClientIDs; the browser-flow fields stay zero.
+	Mode string
+	// AllowedClientIDs, when non-empty, restricts accepted tokens to those
+	// whose client_id claim (the issuing OAuth client; Cognito access tokens
+	// carry it instead of aud) is in the list. Enforced by RBAC on the
+	// claims jwt_authn writes to dynamic metadata.
+	AllowedClientIDs []string
+}
+
+// SSO profile modes.
+const (
+	ModeBrowser = "browser"
+	ModeBearer  = "bearer"
+)
+
+// IsBearer reports whether the profile is bearer-only (no oauth2 filter).
+func (p Profile) IsBearer() bool { return p.Mode == ModeBearer }
+
+// Endpoints lists the IdP endpoints the profile needs clusters for: the
+// token endpoint (browser mode only) and the JWKS endpoint.
+func (p Profile) Endpoints() []Endpoint {
+	if p.IsBearer() {
+		return []Endpoint{p.JWKS}
+	}
+	return []Endpoint{p.TokenEndpoint, p.JWKS}
 }
 
 // HasClientSecret reports whether the profile is a confidential client
@@ -121,13 +149,22 @@ func (p Profile) ClientSecretRef() Secret {
 
 // secrets lists every configured secret reference of the profile.
 func (p Profile) secrets() []Secret {
-	out := []Secret{p.HMACSecret}
-	for _, s := range []Secret{p.TokenSecret, p.ClientSecret} {
+	var out []Secret
+	for _, s := range []Secret{p.HMACSecret, p.TokenSecret, p.ClientSecret} {
 		if s.Name != "" {
 			out = append(out, s)
 		}
 	}
 	return out
+}
+
+// callbackPaths lists the paths the oauth2 filter owns on the callback host
+// (none for a bearer profile).
+func (p Profile) callbackPaths() []string {
+	if p.IsBearer() {
+		return nil
+	}
+	return []string{p.RedirectPath, p.SignoutPath}
 }
 
 // RedirectURI is the absolute OAuth2 callback URI.
@@ -242,6 +279,8 @@ type profileYAML struct {
 		Header string `yaml:"header"`
 		Prefix string `yaml:"prefix"`
 	} `yaml:"pass_through_matcher"`
+	Mode             string   `yaml:"mode"`
+	AllowedClientIDs []string `yaml:"allowed_client_ids"`
 }
 
 // Parse validates file contents. It never fails as a whole except for a
@@ -302,6 +341,17 @@ func parseProfile(name string, node *yaml.Node) (Profile, error) {
 	if err := dec.Decode(&y); err != nil {
 		return Profile{}, fmt.Errorf("decoding profile: %w", err)
 	}
+	allowed, err := parseAllowedClientIDs(y.AllowedClientIDs)
+	if err != nil {
+		return Profile{}, err
+	}
+	switch strings.TrimSpace(y.Mode) {
+	case "", ModeBrowser:
+	case ModeBearer:
+		return parseBearerProfile(name, y, allowed)
+	default:
+		return Profile{}, fmt.Errorf("mode %q is invalid (use %q or %q)", y.Mode, ModeBrowser, ModeBearer)
+	}
 
 	p := Profile{
 		Name:                  name,
@@ -312,6 +362,8 @@ func parseProfile(name string, node *yaml.Node) (Profile, error) {
 		Issuer:                strings.TrimSpace(y.Issuer),
 		AuthorizationEndpoint: strings.TrimSpace(y.AuthorizationEndpoint),
 		JWKSCacheDuration:     DefaultCacheDuration,
+		Mode:                  ModeBrowser,
+		AllowedClientIDs:      allowed,
 	}
 	if p.RedirectPath == "" {
 		p.RedirectPath = DefaultRedirectPath
@@ -427,18 +479,8 @@ func parseProfile(name string, node *yaml.Node) (Profile, error) {
 		}
 	}
 
-	if y.AuthScopes == nil {
-		p.AuthScopes = append([]string(nil), DefaultAuthScopes...)
-	} else {
-		if len(y.AuthScopes) == 0 {
-			return Profile{}, fmt.Errorf("auth_scopes must not be empty (omit it for the default %v)", DefaultAuthScopes)
-		}
-		for _, s := range y.AuthScopes {
-			if s == "" || strings.ContainsAny(s, " \t") {
-				return Profile{}, fmt.Errorf("auth_scopes entry %q must be a non-empty token without whitespace", s)
-			}
-		}
-		p.AuthScopes = append([]string(nil), y.AuthScopes...)
+	if p.AuthScopes, err = parseAuthScopes(y.AuthScopes); err != nil {
+		return Profile{}, err
 	}
 
 	p.PassThrough = PassThroughMatcher{Header: "authorization", Prefix: "Bearer "}
@@ -452,6 +494,96 @@ func parseProfile(name string, node *yaml.Node) (Profile, error) {
 		p.PassThrough = PassThroughMatcher{Header: strings.ToLower(m.Header), Prefix: m.Prefix}
 	}
 	return p, nil
+}
+
+// parseBearerProfile validates a mode: bearer profile: only issuer, jwks,
+// auth_scopes and allowed_client_ids apply. Browser-flow fields are
+// rejected rather than ignored, so a profile cannot look like it has a login
+// flow it does not get.
+func parseBearerProfile(name string, y profileYAML, allowed []string) (Profile, error) {
+	for field, set := range map[string]bool{
+		"redirect_uri_host":      y.RedirectURIHost != "",
+		"redirect_path":          y.RedirectPath != "",
+		"signout_path":           y.SignoutPath != "",
+		"cookie_domain":          y.CookieDomain != "",
+		"authorization_endpoint": y.AuthorizationEndpoint != "",
+		"token_endpoint":         y.TokenEndpoint != nil,
+		"credentials":            y.Credentials != nil,
+		"hmac_secret":            y.HMACSecret != nil,
+		"token_secret":           y.TokenSecret != nil,
+		"pass_through_matcher":   y.PassThroughMatcher != nil,
+	} {
+		if set {
+			return Profile{}, fmt.Errorf("%s does not apply to mode: bearer (no login flow); remove it", field)
+		}
+	}
+	p := Profile{
+		Name:              name,
+		Issuer:            strings.TrimSpace(y.Issuer),
+		JWKSCacheDuration: DefaultCacheDuration,
+		Mode:              ModeBearer,
+		AllowedClientIDs:  allowed,
+	}
+	if p.Issuer == "" {
+		return Profile{}, fmt.Errorf("issuer is required (must equal the iss claim of the IdP's tokens)")
+	}
+	if y.JWKS == nil {
+		return Profile{}, fmt.Errorf("jwks is required ({cluster, uri})")
+	}
+	var err error
+	if p.JWKS, err = parseEndpoint(*y.JWKS); err != nil {
+		return Profile{}, fmt.Errorf("jwks: %w", err)
+	}
+	if y.JWKS.CacheDuration != "" {
+		if p.JWKSCacheDuration, err = parsePositiveDuration(y.JWKS.CacheDuration); err != nil {
+			return Profile{}, fmt.Errorf("jwks.cache_duration: %w", err)
+		}
+	}
+	if p.AuthScopes, err = parseAuthScopes(y.AuthScopes); err != nil {
+		return Profile{}, err
+	}
+	return p, nil
+}
+
+// parseAuthScopes applies the auth_scopes default and validation.
+func parseAuthScopes(in []string) ([]string, error) {
+	if in == nil {
+		return append([]string(nil), DefaultAuthScopes...), nil
+	}
+	if len(in) == 0 {
+		return nil, fmt.Errorf("auth_scopes must not be empty (omit it for the default %v)", DefaultAuthScopes)
+	}
+	for _, s := range in {
+		if s == "" || strings.ContainsAny(s, " \t") {
+			return nil, fmt.Errorf("auth_scopes entry %q must be a non-empty token without whitespace", s)
+		}
+	}
+	return append([]string(nil), in...), nil
+}
+
+// clientIDRE is a conservative OAuth client_id charset (Cognito, Entra,
+// Okta and Google ids all fit).
+var clientIDRE = regexp.MustCompile(`^[A-Za-z0-9._:@-]{1,255}$`)
+
+// parseAllowedClientIDs validates allowed_client_ids: omitted means no
+// client restriction; an explicit empty list is rejected (it would deny
+// everything, which is never what a typo meant). Duplicates are dropped and
+// the result is sorted for deterministic output.
+func parseAllowedClientIDs(in []string) ([]string, error) {
+	if in == nil {
+		return nil, nil
+	}
+	if len(in) == 0 {
+		return nil, fmt.Errorf("allowed_client_ids must not be empty (omit it to accept any client of the issuer)")
+	}
+	seen := map[string]bool{}
+	for _, id := range in {
+		if !clientIDRE.MatchString(id) {
+			return nil, fmt.Errorf("allowed_client_ids entry %q is not a valid client id", id)
+		}
+		seen[id] = true
+	}
+	return sortedKeys(seen), nil
 }
 
 func parseEndpoint(y endpointYAML) (Endpoint, error) {
@@ -573,7 +705,7 @@ func validateCrossProfile(cfg *Config) {
 	for _, name := range sortedKeys(cfg.Profiles) {
 		p := cfg.Profiles[name]
 		var conflict error
-		for _, e := range []Endpoint{p.TokenEndpoint, p.JWKS} {
+		for _, e := range p.Endpoints() {
 			if auth, ok := clusterAuthority[e.Cluster]; ok && auth != e.Authority() {
 				conflict = fmt.Errorf("cluster %q points at %s but profile %q already uses it for %s; use a distinct cluster name", e.Cluster, e.Authority(), clusterOwner[e.Cluster].Name, auth)
 				break
@@ -588,7 +720,7 @@ func validateCrossProfile(cfg *Config) {
 			}
 		}
 		host := strings.ToLower(p.RedirectHostname())
-		for _, path := range []string{p.RedirectPath, p.SignoutPath} {
+		for _, path := range p.callbackPaths() {
 			if conflict != nil {
 				break
 			}
@@ -601,7 +733,7 @@ func validateCrossProfile(cfg *Config) {
 			delete(cfg.Profiles, name)
 			continue
 		}
-		for _, e := range []Endpoint{p.TokenEndpoint, p.JWKS} {
+		for _, e := range p.Endpoints() {
 			clusterAuthority[e.Cluster] = e.Authority()
 			clusterOwner[e.Cluster] = p
 		}
@@ -609,8 +741,9 @@ func validateCrossProfile(cfg *Config) {
 			secretPath[s.Name] = s.SDSPath
 			secretOwner[s.Name] = name
 		}
-		callbackOwner[host+p.RedirectPath] = name
-		callbackOwner[host+p.SignoutPath] = name
+		for _, path := range p.callbackPaths() {
+			callbackOwner[host+path] = name
+		}
 	}
 }
 

@@ -14,10 +14,12 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	headermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
 	oauth2v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/oauth2/v3"
+	rbachttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
@@ -667,5 +669,204 @@ func TestSSOSnapshot_BadClientSecretDropsOnlyThatProfile(t *testing.T) {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("warning log missing %q:\n%s", want, logs.String())
 		}
+	}
+}
+
+// bearerSSOConfig returns a config with browser profile "nas" plus bearer
+// profile "mcp" (sharing the IdP cluster), optionally with an allowlist.
+func bearerSSOConfig(t *testing.T, allowlist string) *sso.Config {
+	t.Helper()
+	doc := "sso_profiles:" + ssoProfileYAML("nas", "sso-nas.example.com") + `
+  mcp:
+    mode: bearer
+    issuer: https://auth.example.com/application/o/nas/
+    jwks: {cluster: sso_idp, uri: https://auth.example.com/application/o/nas/jwks/}
+` + allowlist
+	cfg := sso.Parse("sso.yaml", []byte(doc))
+	if cfg.LoadErr != nil || len(cfg.Invalid) != 0 {
+		t.Fatalf("test SSO config invalid: %v %v", cfg.LoadErr, cfg.Invalid)
+	}
+	return cfg
+}
+
+// appRoutes returns the non-metadata routes of the virtual host serving domain.
+func appRoutes(t *testing.T, rc *routev3.RouteConfiguration, domain string) []*routev3.Route {
+	t.Helper()
+	for _, vh := range rc.VirtualHosts {
+		if len(vh.Domains) > 0 && vh.Domains[0] == domain {
+			var out []*routev3.Route
+			for _, er := range vh.Routes {
+				if !strings.HasPrefix(er.Name, ssoMetadataRoutePrefix) {
+					out = append(out, er)
+				}
+			}
+			if len(out) == 0 {
+				t.Fatalf("vhost %s has no app routes", domain)
+			}
+			return out
+		}
+	}
+	t.Fatalf("no vhost for %s", domain)
+	return nil
+}
+
+func TestSSOSnapshot_BearerModeWithClientAllowlist(t *testing.T) {
+	cfg := bearerSSOConfig(t, "    allowed_client_ids: [hermesclient, claudeclient]\n")
+	snap, err := BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{
+		"app": ssoRoute("app", "nas"),
+		"mcp": ssoRoute("mcp", "mcp"),
+		"www": ssoRoute("www", ""),
+	}}, ssoTestConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hcm := httpsHCM(t, snap)
+	if err := hcm.ValidateAll(); err != nil {
+		t.Fatalf("HCM fails proto validation: %v", err)
+	}
+	names := filterNames(hcm)
+	idx := map[string]int{}
+	for i, n := range names {
+		idx[n] = i
+	}
+	if _, ok := idx[oauth2FilterName("mcp")]; ok {
+		t.Errorf("bearer profile must not get an oauth2 filter: %v", names)
+	}
+	if _, ok := idx[oauth2FilterName("nas")]; !ok {
+		t.Errorf("browser profile lost its oauth2 filter: %v", names)
+	}
+	ri, ok := idx[ssoClientsRBACFilterName]
+	if !ok || ri != idx[jwtAuthnFilterName]+1 {
+		t.Fatalf("clients RBAC filter must directly follow jwt_authn: %v", names)
+	}
+
+	// jwt_authn: mcp provider writes its payload to metadata; nas does not.
+	var jwt jwtauthnv3.JwtAuthentication
+	var rbacMain rbachttpv3.RBAC
+	for _, f := range hcm.HttpFilters {
+		switch f.Name {
+		case jwtAuthnFilterName:
+			if err := f.GetTypedConfig().UnmarshalTo(&jwt); err != nil {
+				t.Fatal(err)
+			}
+		case ssoClientsRBACFilterName:
+			if err := f.GetTypedConfig().UnmarshalTo(&rbacMain); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if got := jwt.Providers["mcp"].GetPayloadInMetadata(); got != "mcp" {
+		t.Errorf("mcp payload_in_metadata = %q, want mcp", got)
+	}
+	if got := jwt.Providers["nas"].GetPayloadInMetadata(); got != "" {
+		t.Errorf("nas payload_in_metadata = %q, want empty (no allowlist)", got)
+	}
+	if rbacMain.GetRules() != nil {
+		t.Errorf("listener-wide clients RBAC must have no rules (allow), got %v", rbacMain.GetRules())
+	}
+
+	rc := httpsRouteConfig(t, snap)
+	if err := rc.ValidateAll(); err != nil {
+		t.Fatalf("route config fails proto validation: %v", err)
+	}
+	// No callback vhost is synthesized for a bearer profile.
+	for _, vh := range rc.VirtualHosts {
+		if strings.HasPrefix(vh.Name, ssoCallbackVHPrefix) && vh.Domains[0] != "sso-nas.example.com" {
+			t.Errorf("unexpected callback vhost %s", vh.Name)
+		}
+	}
+	for _, er := range appRoutes(t, rc, "mcp.example.com") {
+		tpfc := er.TypedPerFilterConfig
+		var req jwtauthnv3.PerRouteConfig
+		if err := tpfc[jwtAuthnFilterName].UnmarshalTo(&req); err != nil || req.GetRequirementName() != "mcp" {
+			t.Errorf("route %s jwt requirement = %v (%v), want mcp", er.Name, req.GetRequirementName(), err)
+		}
+		var fc routev3.FilterConfig
+		if err := tpfc[oauth2FilterName("nas")].UnmarshalTo(&fc); err != nil || !fc.GetDisabled() {
+			t.Errorf("route %s: nas oauth2 must be disabled (no login redirect)", er.Name)
+		}
+		if _, ok := tpfc[oauth2FilterName("mcp")]; ok {
+			t.Errorf("route %s references nonexistent oauth2 filter for mcp", er.Name)
+		}
+		var pr rbachttpv3.RBACPerRoute
+		if err := tpfc[ssoClientsRBACFilterName].UnmarshalTo(&pr); err != nil {
+			t.Fatalf("route %s missing clients RBAC: %v", er.Name, err)
+		}
+		pol := pr.GetRbac().GetRules().GetPolicies()["sso_allowed_clients_mcp"]
+		if pr.GetRbac().GetRules().GetAction() != rbacv3.RBAC_ALLOW || pol == nil {
+			t.Fatalf("route %s RBAC = %v, want ALLOW policy sso_allowed_clients_mcp", er.Name, pr.GetRbac())
+		}
+		var ids []string
+		for _, pp := range pol.GetPrincipals() {
+			m := pp.GetMetadata()
+			if m.GetFilter() != jwtAuthnFilterName || len(m.GetPath()) != 2 ||
+				m.GetPath()[0].GetKey() != "mcp" || m.GetPath()[1].GetKey() != "client_id" {
+				t.Errorf("principal matcher = %v, want jwt_authn metadata mcp.client_id", m)
+			}
+			ids = append(ids, m.GetValue().GetStringMatch().GetExact())
+		}
+		if got := strings.Join(ids, ","); got != "claudeclient,hermesclient" {
+			t.Errorf("allowed ids = %q, want claudeclient,hermesclient", got)
+		}
+	}
+	// Browser-profile and public routes get no clients RBAC policy.
+	for _, domain := range []string{"app.example.com", "www.example.com"} {
+		for _, er := range appRoutes(t, rc, domain) {
+			if _, ok := er.TypedPerFilterConfig[ssoClientsRBACFilterName]; ok {
+				t.Errorf("%s route %s must not carry the clients RBAC policy", domain, er.Name)
+			}
+		}
+	}
+	// Metadata routes stay public: no RBAC override, jwt disabled.
+	found := false
+	for _, vh := range rc.VirtualHosts {
+		for _, er := range vh.Routes {
+			if strings.HasPrefix(er.Name, ssoMetadataRoutePrefix+"mcp.example.com") {
+				found = true
+				if _, ok := er.TypedPerFilterConfig[ssoClientsRBACFilterName]; ok {
+					t.Errorf("metadata route %s must not carry RBAC", er.Name)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Error("bearer host has no protected resource metadata route")
+	}
+	// The bearer host gets the RFC 9728 challenge mapper.
+	var challengeHosts []string
+	for _, m := range hcm.GetLocalReplyConfig().GetMappers() {
+		challengeHosts = append(challengeHosts, m.GetHeadersToAdd()[0].GetHeader().GetValue())
+	}
+	if !strings.Contains(strings.Join(challengeHosts, " "), "https://mcp.example.com/.well-known/oauth-protected-resource") {
+		t.Errorf("no challenge mapper for the bearer host: %v", challengeHosts)
+	}
+}
+
+func TestSSOSnapshot_BearerOnlyNoAllowlist(t *testing.T) {
+	cfg := bearerSSOConfig(t, "")
+	snap, err := BuildSnapshotForConfig("1", model.HTTPConfiguration{Routes: map[string]model.Route{
+		"mcp": ssoRoute("mcp", "mcp"),
+	}}, ssoTestConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hcm := httpsHCM(t, snap)
+	if err := hcm.ValidateAll(); err != nil {
+		t.Fatalf("HCM fails proto validation: %v", err)
+	}
+	for _, n := range filterNames(hcm) {
+		if strings.HasPrefix(n, oauth2FilterPrefix) || n == ssoClientsRBACFilterName {
+			t.Errorf("bearer-only listener without allowlist must have no %s filter", n)
+		}
+	}
+	rc := httpsRouteConfig(t, snap)
+	for _, vh := range rc.VirtualHosts {
+		if strings.HasPrefix(vh.Name, ssoCallbackVHPrefix) {
+			t.Errorf("bearer-only listener synthesized callback vhost %s", vh.Name)
+		}
+	}
+	// Only the jwks cluster's IdP cluster is emitted (shared name sso_idp).
+	if c := snap.GetResources(resourcev3.ClusterType)["sso_idp"]; c == nil {
+		t.Error("jwks cluster sso_idp not emitted for bearer profile")
 	}
 }
