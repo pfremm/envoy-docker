@@ -198,3 +198,87 @@ func TestLoaderReloadsOnChange(t *testing.T) {
 		t.Fatalf("empty path must disable SSO")
 	}
 }
+
+const bearerProfileYAML = `
+    mode: bearer
+    issuer: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_pool
+    jwks: {cluster: cognito_jwks, uri: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_pool/.well-known/jwks.json}
+    allowed_client_ids: [clientB, clientA, clientB]
+`
+
+func TestParseBearerProfile(t *testing.T) {
+	cfg := Parse("sso.yaml", []byte(profileDoc("mcp", bearerProfileYAML)))
+	if cfg.LoadErr != nil || len(cfg.Invalid) != 0 {
+		t.Fatalf("unexpected errors: load=%v invalid=%v", cfg.LoadErr, cfg.Invalid)
+	}
+	p, err := cfg.Lookup("mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.IsBearer() || p.Mode != ModeBearer {
+		t.Errorf("mode = %q, want bearer", p.Mode)
+	}
+	if got := strings.Join(p.AllowedClientIDs, ","); got != "clientA,clientB" {
+		t.Errorf("allowed_client_ids = %q, want sorted+deduped clientA,clientB", got)
+	}
+	if got := strings.Join(p.AuthScopes, " "); got != "openid email" {
+		t.Errorf("auth_scopes = %q, want default", got)
+	}
+	if eps := p.Endpoints(); len(eps) != 1 || eps[0].Cluster != "cognito_jwks" {
+		t.Errorf("Endpoints = %+v, want only the jwks endpoint", eps)
+	}
+	if len(p.secrets()) != 0 || len(p.callbackPaths()) != 0 {
+		t.Errorf("bearer profile must have no secrets/callbacks: %v %v", p.secrets(), p.callbackPaths())
+	}
+}
+
+func TestParseBearerProfileRejections(t *testing.T) {
+	base := `
+    mode: bearer
+    issuer: https://issuer.example.com/
+    jwks: {cluster: jwks, uri: https://issuer.example.com/jwks}
+`
+	for name, tc := range map[string]struct{ body, want string }{
+		"browser field":   {base + "    cookie_domain: example.com\n", "cookie_domain does not apply to mode: bearer"},
+		"credentials":     {base + "    credentials: {client_id: x}\n", "credentials does not apply"},
+		"token endpoint":  {base + "    token_endpoint: {cluster: t, uri: https://issuer.example.com/token}\n", "token_endpoint does not apply"},
+		"empty allowlist": {base + "    allowed_client_ids: []\n", "allowed_client_ids must not be empty"},
+		"bad client id":   {base + "    allowed_client_ids: [\"a b\"]\n", "not a valid client id"},
+		"missing jwks":    {"\n    mode: bearer\n    issuer: https://issuer.example.com/\n", "jwks is required"},
+		"missing issuer":  {"\n    mode: bearer\n    jwks: {cluster: jwks, uri: https://issuer.example.com/jwks}\n", "issuer is required"},
+		"unknown mode":    {base[:0] + "\n    mode: api\n" + validProfileYAML[1:], `mode "api" is invalid`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := Parse("sso.yaml", []byte(profileDoc("p", tc.body)))
+			err := cfg.Invalid["p"]
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseBrowserProfileWithAllowlist(t *testing.T) {
+	cfg := Parse("sso.yaml", []byte(profileDoc("nas", validProfileYAML+"    allowed_client_ids: [envoy-nas]\n")))
+	p, err := cfg.Lookup("nas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.IsBearer() || p.Mode != ModeBrowser || len(p.AllowedClientIDs) != 1 {
+		t.Errorf("profile = mode %q allowed %v, want browser with one allowed id", p.Mode, p.AllowedClientIDs)
+	}
+}
+
+func TestParseBearerAndBrowserCoexist(t *testing.T) {
+	// A bearer profile may share the browser profile's JWKS cluster.
+	doc := profileDoc("nas", validProfileYAML) + `
+  mcp:
+    mode: bearer
+    issuer: https://auth.example.com/application/o/nas/
+    jwks: {cluster: sso_idp, uri: https://auth.example.com/application/o/nas/jwks/}
+`
+	cfg := Parse("sso.yaml", []byte(doc))
+	if cfg.LoadErr != nil || len(cfg.Invalid) != 0 || len(cfg.Profiles) != 2 {
+		t.Fatalf("load=%v invalid=%v profiles=%d", cfg.LoadErr, cfg.Invalid, len(cfg.Profiles))
+	}
+}

@@ -850,6 +850,8 @@ plain string, or with any key other than `name` and `sds_path` (such as
 | `auth_scopes` | no | `[openid, email]` | Requested scopes. If present it must be non-empty, and no entry may be empty or contain whitespace. |
 | `pass_through_matcher.header` | if block present | `authorization` | Header whose presence (with `prefix`) skips the browser flow. Must be a valid HTTP header name. Matched case-insensitively. |
 | `pass_through_matcher.prefix` | if block present | `Bearer ` | Required, non-empty value prefix. |
+| `mode` | no | `browser` | `browser` (oauth2 login flow + jwt_authn) or `bearer` (jwt_authn only, no login flow). See [Bearer-only profiles](#bearer-only-profiles-mcp-and-api-clients). |
+| `allowed_client_ids` | no | any client | List of OAuth client ids whose tokens are accepted (matched against the token's `client_id` claim). Omit to accept any client of the issuer; an explicit empty list is rejected. Valid in both modes. |
 
 Profiles are also checked against each other, in sorted name order. When two
 profiles conflict, the later one is invalidated. A cluster name must point at
@@ -893,6 +895,55 @@ TOKEN=$(curl -s https://auth.example.com/application/o/token/ \
 curl -H "Authorization: Bearer $TOKEN" https://files.nas2.pfrem.me/api/status
 # no token / bad token -> 401 from Envoy, never a 302 to the IdP
 ```
+
+### Bearer-only profiles (MCP and API clients)
+
+A profile with `mode: bearer` has no login flow: no oauth2 filter, no
+callback routes, no cookies. Only `issuer`, `jwks`, `auth_scopes` and
+`allowed_client_ids` apply; every browser-flow field (`redirect_uri_host`,
+`cookie_domain`, `authorization_endpoint`, `token_endpoint`, `credentials`,
+`hmac_secret`, `token_secret`, `pass_through_matcher`) is rejected. Clients
+obtain tokens from the IdP themselves.
+
+On a bearer host:
+
+- a request without a token gets **401** from jwt_authn (never a 302), with
+  `WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource"`;
+- `/.well-known/oauth-protected-resource` (and `/.well-known/oauth-protected-resource/mcp`)
+  serve the RFC 9728 document (`resource`, `authorization_servers: [issuer]`,
+  `scopes_supported: auth_scopes`) without authentication.
+
+That is the discovery chain MCP clients follow (MCP authorization spec): 401
+→ protected resource metadata → the issuer's authorization server / OIDC
+metadata → authorization-code + PKCE login → retry with the access token. IdPs
+without dynamic client registration (e.g. Cognito) need the client
+pre-registered with its exact callback URL and configured in the MCP client.
+
+**Client allowlist.** `allowed_client_ids` restricts accepted tokens to those
+issued to the listed OAuth clients. jwt_authn writes the verified claims to
+dynamic metadata (`envoy.filters.http.jwt_authn` / `<profile>`), and an RBAC
+filter (`envoy.filters.http.rbac.sso_clients`, separate from the IP
+allow/deny RBAC) allows only tokens whose `client_id` claim is listed; any
+other valid token from the same issuer gets **403**. Cognito access tokens
+carry `client_id` (they have no `aud`); ID tokens carry `aud` instead and are
+therefore rejected by the allowlist.
+
+```yaml
+sso_profiles:
+  cognito-mcp:
+    mode: bearer
+    issuer: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EXAMPLE
+    jwks: {cluster: cognito_jwks, uri: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EXAMPLE/.well-known/jwks.json}
+    allowed_client_ids: [hermes-client-id, claude-client-id]
+```
+
+```yaml
+labels:
+  envoy.http.routers.obsidian-mcp.sso: cognito-mcp
+```
+
+Routers choose a profile but cannot change its rules: the allowlist and mode
+live only in the operator's `SSO_CONFIG_PATH` file.
 
 ### Callback host pattern
 

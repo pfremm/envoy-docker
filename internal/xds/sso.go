@@ -10,10 +10,12 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	mutationrulesv3 "github.com/envoyproxy/go-control-plane/envoy/config/common/mutation_rules/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	headermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
 	oauth2v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/oauth2/v3"
+	rbachttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
@@ -33,6 +35,16 @@ const (
 	jwtAuthnFilterName = "envoy.filters.http.jwt_authn"
 	ssoHSTSFilterName  = "envoy.filters.http.header_mutation.sso_hsts"
 
+	// ssoClientsRBACFilterName enforces profiles' allowed_client_ids. It is
+	// distinct from the IP allow/deny RBAC filter (rbacFilterName) so the
+	// two per-route policies never overwrite each other. Listener-wide it
+	// has no rules (allow); routes of a restricted profile carry the policy.
+	ssoClientsRBACFilterName = "envoy.filters.http.rbac.sso_clients"
+
+	// ssoClientIDClaim is the token claim naming the issuing OAuth client.
+	// Cognito access tokens carry it (they have no aud claim).
+	ssoClientIDClaim = "client_id"
+
 	// ssoCallbackVHPrefix names the virtual host synthesized for a
 	// redirect_uri_host no router serves.
 	ssoCallbackVHPrefix = "sso_callback__"
@@ -50,6 +62,18 @@ const (
 )
 
 func oauth2FilterName(profile string) string { return oauth2FilterPrefix + profile }
+
+// browserProfiles returns the profiles that run the oauth2 login flow
+// (everything but mode: bearer), preserving order.
+func browserProfiles(profiles []sso.Profile) []sso.Profile {
+	out := make([]sso.Profile, 0, len(profiles))
+	for _, p := range profiles {
+		if !p.IsBearer() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 // applyHSTS enables HSTS on an HTTPS route configuration. It is only ever
 // applied to the TLS listeners' RDS configs; the plain-HTTP redirect
@@ -213,7 +237,12 @@ func applySSOToRouteConfig(rc *routev3.RouteConfiguration, profileByRoute map[st
 		profiles = append(profiles, p)
 	}
 
-	callbacks := addSSOCallbackRoutes(rc, profiles)
+	browser := browserProfiles(profiles)
+	byName := make(map[string]sso.Profile, len(profiles))
+	for _, p := range profiles {
+		byName[p.Name] = p
+	}
+	callbacks := addSSOCallbackRoutes(rc, browser)
 
 	for _, vh := range rc.VirtualHosts {
 		for _, er := range vh.Routes {
@@ -224,7 +253,10 @@ func applySSOToRouteConfig(rc *routev3.RouteConfiguration, profileByRoute map[st
 			if er.TypedPerFilterConfig == nil {
 				er.TypedPerFilterConfig = map[string]*anypb.Any{}
 			}
-			for _, p := range profiles {
+			// A bearer profile's routes get every oauth2 filter disabled:
+			// no login redirect, jwt_authn alone answers a missing token
+			// with 401 (plus the RFC 9728 challenge).
+			for _, p := range browser {
 				if p.Name != enabled {
 					er.TypedPerFilterConfig[oauth2FilterName(p.Name)] = mustAny(&routev3.FilterConfig{Disabled: true})
 				}
@@ -233,6 +265,9 @@ func applySSOToRouteConfig(rc *routev3.RouteConfiguration, profileByRoute map[st
 				er.TypedPerFilterConfig[jwtAuthnFilterName] = mustAny(&jwtauthnv3.PerRouteConfig{
 					RequirementSpecifier: &jwtauthnv3.PerRouteConfig_RequirementName{RequirementName: enabled},
 				})
+				if p := byName[enabled]; len(p.AllowedClientIDs) > 0 {
+					er.TypedPerFilterConfig[ssoClientsRBACFilterName] = mustAny(ssoClientsRBACPerRoute(p))
+				}
 			} else {
 				er.TypedPerFilterConfig[jwtAuthnFilterName] = mustAny(&jwtauthnv3.PerRouteConfig{
 					RequirementSpecifier: &jwtauthnv3.PerRouteConfig_Disabled{Disabled: true},
@@ -257,7 +292,7 @@ func applySSOToRouteConfig(rc *routev3.RouteConfiguration, profileByRoute map[st
 			}
 		}
 	}
-	addProtectedResourceMetadataRoutes(rc, firstProfileByHost, profiles)
+	addProtectedResourceMetadataRoutes(rc, firstProfileByHost, browser)
 	return profiles, sortedStringKeys(firstProfileByHost)
 }
 
@@ -351,9 +386,11 @@ func protectedResourceMetadataJSON(domain string, p sso.Profile) string {
 // discovery from a bare 401. The document is public: on these routes every
 // sso filter is disabled (oauth2 would otherwise redirect the metadata
 // fetch to the login flow, and jwt_authn would reject it), and they are
-// prepended so they take precedence over the host's prefix routes. Call
-// after the per-route oauth2/jwt_authn assignments are complete.
-func addProtectedResourceMetadataRoutes(rc *routev3.RouteConfiguration, byHost map[string]sso.Profile, profiles []sso.Profile) {
+// prepended so they take precedence over the host's prefix routes. They get
+// no client-allowlist RBAC policy, so the listener-wide allow applies. Call
+// after the per-route oauth2/jwt_authn assignments are complete; browser
+// lists the profiles that have an oauth2 filter on the listener.
+func addProtectedResourceMetadataRoutes(rc *routev3.RouteConfiguration, byHost map[string]sso.Profile, browser []sso.Profile) {
 	if len(byHost) == 0 {
 		return
 	}
@@ -363,7 +400,7 @@ func addProtectedResourceMetadataRoutes(rc *routev3.RouteConfiguration, byHost m
 		var metaRoutes []*routev3.Route
 		for _, path := range []string{ssoProtectedResourceWellKnownPath, ssoProtectedResourceWellKnownPath + "/mcp"} {
 			overrides := map[string]*anypb.Any{}
-			for _, prof := range profiles {
+			for _, prof := range browser {
 				overrides[oauth2FilterName(prof.Name)] = mustAny(&routev3.FilterConfig{Disabled: true})
 			}
 			overrides[jwtAuthnFilterName] = mustAny(&jwtauthnv3.PerRouteConfig{
@@ -499,12 +536,15 @@ func ssoHTTPFilters(profiles []sso.Profile) []*hcmv3.HttpFilter {
 		Providers:      map[string]*jwtauthnv3.JwtProvider{},
 		RequirementMap: map[string]*jwtauthnv3.JwtRequirement{},
 	}
-	for _, p := range profiles {
+	needClientsRBAC := false
+	for _, p := range browserProfiles(profiles) {
 		filters = append(filters, &hcmv3.HttpFilter{
 			Name:       oauth2FilterName(p.Name),
 			ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mustAny(oauth2Config(p))},
 		})
-		jwt.Providers[p.Name] = &jwtauthnv3.JwtProvider{
+	}
+	for _, p := range profiles {
+		provider := &jwtauthnv3.JwtProvider{
 			Issuer: p.Issuer,
 			JwksSourceSpecifier: &jwtauthnv3.JwtProvider_RemoteJwks{RemoteJwks: &jwtauthnv3.RemoteJwks{
 				HttpUri:       ssoHTTPURI(p.JWKS),
@@ -513,6 +553,13 @@ func ssoHTTPFilters(profiles []sso.Profile) []*hcmv3.HttpFilter {
 			Forward:     true,
 			FromHeaders: []*jwtauthnv3.JwtHeader{{Name: "Authorization", ValuePrefix: "Bearer "}},
 		}
+		if len(p.AllowedClientIDs) > 0 {
+			// Verified claims land in dynamic metadata under
+			// envoy.filters.http.jwt_authn/<profile> for the RBAC check.
+			provider.PayloadInMetadata = p.Name
+			needClientsRBAC = true
+		}
+		jwt.Providers[p.Name] = provider
 		jwt.RequirementMap[p.Name] = &jwtauthnv3.JwtRequirement{
 			RequiresType: &jwtauthnv3.JwtRequirement_ProviderName{ProviderName: p.Name},
 		}
@@ -521,7 +568,47 @@ func ssoHTTPFilters(profiles []sso.Profile) []*hcmv3.HttpFilter {
 		Name:       jwtAuthnFilterName,
 		ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mustAny(jwt)},
 	})
+	if needClientsRBAC {
+		// Must follow jwt_authn: it reads the metadata jwt_authn writes.
+		// No rules listener-wide = allow; restricted routes override.
+		filters = append(filters, &hcmv3.HttpFilter{
+			Name:       ssoClientsRBACFilterName,
+			ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mustAny(&rbachttpv3.RBAC{})},
+		})
+	}
 	return filters
+}
+
+// ssoClientsRBACPerRoute allows a request only when the client_id claim of
+// the token jwt_authn verified for profile p is one of p.AllowedClientIDs
+// (one principal per id; principals are OR'ed). A token from any other
+// client of the same issuer gets 403. jwt_authn runs first and has already
+// rejected a missing or invalid token with 401.
+func ssoClientsRBACPerRoute(p sso.Profile) *rbachttpv3.RBACPerRoute {
+	principals := make([]*rbacv3.Principal, 0, len(p.AllowedClientIDs))
+	for _, id := range p.AllowedClientIDs {
+		principals = append(principals, &rbacv3.Principal{Identifier: &rbacv3.Principal_Metadata{
+			Metadata: &matcherv3.MetadataMatcher{
+				Filter: jwtAuthnFilterName,
+				Path: []*matcherv3.MetadataMatcher_PathSegment{
+					{Segment: &matcherv3.MetadataMatcher_PathSegment_Key{Key: p.Name}},
+					{Segment: &matcherv3.MetadataMatcher_PathSegment_Key{Key: ssoClientIDClaim}},
+				},
+				Value: &matcherv3.ValueMatcher{MatchPattern: &matcherv3.ValueMatcher_StringMatch{
+					StringMatch: &matcherv3.StringMatcher{MatchPattern: &matcherv3.StringMatcher_Exact{Exact: id}},
+				}},
+			},
+		}})
+	}
+	return &rbachttpv3.RBACPerRoute{Rbac: &rbachttpv3.RBAC{Rules: &rbacv3.RBAC{
+		Action: rbacv3.RBAC_ALLOW,
+		Policies: map[string]*rbacv3.Policy{
+			"sso_allowed_clients_" + p.Name: {
+				Permissions: []*rbacv3.Permission{{Rule: &rbacv3.Permission_Any{Any: true}}},
+				Principals:  principals,
+			},
+		},
+	}}}
 }
 
 // oauth2Config builds the oauth2 filter config for a profile. Envoy v1.37
@@ -605,7 +692,7 @@ func ssoClusters(profiles map[string]sso.Profile) []*clusterv3.Cluster {
 	byName := map[string]sso.Endpoint{}
 	for _, name := range sortedStringKeys(profiles) {
 		p := profiles[name]
-		for _, e := range []sso.Endpoint{p.TokenEndpoint, p.JWKS} {
+		for _, e := range p.Endpoints() {
 			if _, seen := byName[e.Cluster]; !seen {
 				byName[e.Cluster] = e
 			}
